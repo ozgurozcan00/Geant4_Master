@@ -2,30 +2,33 @@
 # -*- coding: utf-8 -*-
 """
 Geant4 ROOT zırhlama analiz GUI'si (PyQt5 + uproot + matplotlib)
-Gelişmiş Sürüm: 3D/2D + Parçacık Özeti + Volume Özeti + Track Viewer + Geometri Overlay.
+Gelişmiş Sürüm (TRACKS + GEOMETRY + PDG + Çoklu Grafikler)
 
-Özellik özet:
-- ROOT ntuple'larından (Hits TTree'si) şu analizleri yapar:
-    * Enerji spektrumu (Edep histogramı)
-    * Derinlik-doz (Z vs ΣEdep)
-    * Zayıflama eğrisi (ΣEdep vs kalınlık -> µ, HVL, TVL)
-    * 3D hit haritası (X,Y,Z, renk=Edep)
-    * 2D doz haritası (X–Z ΣEdep heatmap)
-    * Parçacık (PDG) bazlı doz özeti
-    * Volume (region) bazlı doz özeti (volumeID branch'i üzerinden)
-    * Özet tablosu (dosya, kalınlık, ΣEdep, I/I0)
-- Track destekli veri varsa (eventID, trackID, parentID, stepIndex):
-    * Yeni sekme: "Track Viewer"
-    * Seçilen eventID için:
-        - Tüm track'ler, primary/secondary ayrımı ile çizilir.
-        - Primary track'ler kalın çizgi, secondary'ler ince çizgi/veya noktalı.
-        - volumeID'lere göre yarı-şeffaf kutu geometri overlay'i (data'dan otomatik bounding box).
-    * Event seçimi için spinbox: "Görüntülenecek EventID"
-    * Sadece primary, sadece secondary, belirli PDG seti gibi filtreler uygulanabilir.
+Özellikler:
+- Enerji spektrumu:
+    * Her dosya için ayrı ayrı çizim
+    * Tüm dosyaları kıyaslamalı tek grafikte üst üste (renkli, legend ile)
+    * Kullanıcı tanımlı başlık
+- Derinlik-doz:
+    * Her dosya için tekil grafik
+    * Tüm kalınlıkları kıyaslamalı grafik
+    * Kullanıcı tanımlı başlık
+- Attenuation (µ, HVL, TVL):
+    * Tüm kalınlıklar için fit ve kıyaslama
+    * Kullanıcı tanımlı başlık
+- 2D doz haritası (X-Z):
+    * Son dosyanın haritası (tekil)
+    * Tüm dosyaların toplam doz haritası (ortalama / sum)
+- 3D hit haritası:
+    * Son dosya için 3D nokta bulutu
+- Track Viewer:
+    * PDG'ye göre renk, primary/secondary ayrımı, secondary verteks marker
+    * volumeID'lerden şeffaf geometri kutuları
+- Parçacık ve volume özet tabloları
 
-ROOT gerektirmez, sadece:
-    pip install pyqt5 uproot matplotlib numpy
-yeterli.
+Not:
+- Auger elektronu, Cherenkov fotonu, X-ışını gibi ayrımlar için Geant4 tarafında
+  process / creatorProcess branch'leri eklenmelidir. Bu GUI şu anda PDG bazlı ayrım yapar.
 """
 
 import sys
@@ -68,6 +71,43 @@ from PyQt5.QtWidgets import (
     QTableWidgetItem,
 )
 from PyQt5.QtCore import Qt
+
+
+# ---------- PDG yardımcıları ----------
+
+PDG_NAME_MAP = {
+    11: "e⁻",
+    -11: "e⁺",
+    13: "μ⁻",
+    -13: "μ⁺",
+    22: "γ",
+    2112: "n",
+    2212: "p",
+    0: "optik foton",  # Cherenkov / scintillation (Geant4 optical photon)
+}
+
+
+def pdg_name(pdg: int) -> str:
+    return PDG_NAME_MAP.get(pdg, f"PDG {pdg}")
+
+
+def pdg_color(pdg: int) -> str:
+    """PDG türüne göre renk (track viewer için)."""
+    if pdg == 11:
+        return "tab:blue"
+    if pdg == -11:
+        return "tab:cyan"
+    if pdg == 22:
+        return "tab:orange"
+    if pdg == 2212:
+        return "tab:red"
+    if pdg == 2112:
+        return "tab:green"
+    if pdg in (13, -13):
+        return "tab:purple"
+    if pdg == 0:
+        return "tab:pink"
+    return "tab:gray"
 
 
 # ---------- Yardımcı: dosya adından kalınlık çıkarma ----------
@@ -121,7 +161,6 @@ def read_tree(filename: str, tree_name: str):
 
 
 def list_ttrees_in_file(filename: str) -> List[str]:
-    """Dosyadaki TTree isimlerini döndür."""
     f = uproot.open(filename)
     names = []
     for k, obj in f.items():
@@ -131,7 +170,6 @@ def list_ttrees_in_file(filename: str) -> List[str]:
 
 
 def list_branches_in_tree(filename: str, tree_name: str) -> List[str]:
-    """Belirli bir TTree içindeki branch isimlerini döndür."""
     tree = read_tree(filename, tree_name)
     return list(tree.keys())
 
@@ -227,10 +265,8 @@ def compute_total_output_from_window(edep: np.ndarray,
     """
     Zayıflama analizi için I ~ ΣEdep.
 
-    Eğer z, zmin, zmax verilmişse:
-        - Sadece zmin <= Z <= zmax aralığındaki Edep'ler toplanır.
-    Aksi halde:
-        - Tüm Edep'ler toplanır.
+    Eğer z, zmin, zmax verilmişse -> sadece zmin <= Z <= zmax aralığı kullanılır.
+    Aksi halde tüm hacim kullanılır.
     """
     edep = np.asarray(edep, dtype=float)
     mask = np.isfinite(edep)
@@ -291,12 +327,10 @@ def fit_attenuation(thickness_mm: List[float],
 
 
 def save_csv(filename: str, header: str, data: np.ndarray):
-    """Basit CSV kaydedici."""
     np.savetxt(filename, data, delimiter=",", header=header, comments="")
 
 
 def parse_int_list(text: str) -> List[int]:
-    """'11,22,13' gibi bir metni [11,22,13] listesine çevir."""
     text = text.strip()
     if not text:
         return []
@@ -311,9 +345,7 @@ def parse_int_list(text: str) -> List[int]:
 
 
 def autodetect_xyz_branches(branches: List[str]) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    """X/Y/Z branch isimlerini tipik kalıplara göre otomatik tahmin et."""
     lower_map = {b.lower(): b for b in branches}
-
     candidates_x = ["posx", "x", "prex", "postx"]
     candidates_y = ["posy", "y", "prey", "posty"]
     candidates_z = ["posz", "z", "prez", "postz"]
@@ -330,47 +362,85 @@ def autodetect_xyz_branches(branches: List[str]) -> Tuple[Optional[str], Optiona
 # ---------- Matplotlib Canvas sınıfları ----------
 
 class PlotCanvas(FigureCanvas):
-    """2B grafikler için basit matplotlib canvas'ı."""
+    """2B grafikler için canvas."""
 
     def __init__(self, parent=None):
-        fig = Figure(figsize=(5, 4), dpi=100)
+        fig = Figure(figsize=(5, 4), dpi=120)
         super().__init__(fig)
         self.setParent(parent)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.updateGeometry()
 
-    def plot_energy(self, centers, hist, title, xlabel, ylog: bool = False):
+    def plot_energy(self, centers, hist_list, labels, title, xlabel, ylog: bool = False):
+        """
+        Bir veya birden çok spektrumu aynı grafikte çizer.
+        hist_list: [np.ndarray, ...]
+        labels: [str, ...]
+        """
         self.figure.clear()
         ax = self.figure.add_subplot(111)
-        ax.step(centers, hist, where="mid")
+
+        if not isinstance(hist_list, (list, tuple)):
+            hist_list = [hist_list]
+        if not isinstance(centers[0], np.ndarray):
+            centers_list = [centers]
+        else:
+            centers_list = centers
+
+        for i, h in enumerate(hist_list):
+            if isinstance(centers_list, list) and len(centers_list) == len(hist_list):
+                c = centers_list[i]
+            else:
+                c = centers
+            lbl = labels[i] if labels and i < len(labels) else None
+            ax.plot(c, h, marker="o", markersize=3, linewidth=1.5, label=lbl)
+
         ax.set_xlabel(xlabel)
         ax.set_ylabel("Counts")
         ax.set_title(title)
-        if ylog and np.any(hist > 0):
+        if ylog and any(np.any(h > 0) for h in hist_list):
             ax.set_yscale("log")
         else:
             ax.set_yscale("linear")
         ax.grid(True, linestyle="--", alpha=0.5)
+        if labels and any(labels):
+            ax.legend(fontsize=8)
         self.figure.tight_layout()
         self.draw()
 
-    def plot_depth_dose(self, z_centers, dose, title, xlabel):
+    def plot_depth_dose(self, z_list, dose_list, labels, title, xlabel):
+        """
+        Bir veya birden çok derinlik-doz eğrisini çizer.
+        """
         self.figure.clear()
         ax = self.figure.add_subplot(111)
-        if z_centers.size > 0:
-            ax.plot(z_centers, dose, marker="o")
+
+        if not isinstance(z_list, (list, tuple)):
+            z_list = [z_list]
+        if not isinstance(dose_list, (list, tuple)):
+            dose_list = [dose_list]
+
+        for i, zc in enumerate(z_list):
+            if zc is None or len(zc) == 0:
+                continue
+            d = dose_list[i]
+            lbl = labels[i] if labels and i < len(labels) else None
+            ax.plot(zc, d, marker="o", markersize=3, linewidth=1.5, label=lbl)
+
         ax.set_xlabel(xlabel)
         ax.set_ylabel("ΣEdep [a.u.]")
         ax.set_title(title)
         ax.grid(True, linestyle="--", alpha=0.5)
+        if labels and any(labels):
+            ax.legend(fontsize=8)
         self.figure.tight_layout()
         self.draw()
 
     def plot_attenuation(self, t, I_norm, t_fit, I_fit_norm, mu, HVL, TVL, title):
         self.figure.clear()
         ax = self.figure.add_subplot(111)
-        ax.scatter(t, I_norm, label="Simülasyon Noktaları")
-        ax.plot(t_fit, I_fit_norm, linestyle="--", label="Fit")
+        ax.scatter(t, I_norm, label="Simülasyon Noktaları", s=20)
+        ax.plot(t_fit, I_fit_norm, linestyle="--", linewidth=1.6, label="Fit")
         ax.set_xlabel("Kalınlık [mm]")
         ax.set_ylabel("I / I0")
         ax.set_title(title)
@@ -387,9 +457,10 @@ class PlotCanvas(FigureCanvas):
             xycoords="axes fraction",
             va="top",
             ha="left",
+            fontsize=9,
             bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
         )
-        ax.legend()
+        ax.legend(fontsize=8)
         self.figure.tight_layout()
         self.draw()
 
@@ -418,7 +489,7 @@ class PlotCanvas3D(FigureCanvas):
     """3B hit haritası için canvas."""
 
     def __init__(self, parent=None):
-        fig = Figure(figsize=(5, 4), dpi=100)
+        fig = Figure(figsize=(5, 4), dpi=120)
         super().__init__(fig)
         self.setParent(parent)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -461,25 +532,22 @@ class TrackCanvas3D(FigureCanvas):
     """
     Track viewer için 3B canvas.
 
-    Özellikler:
-    - Her track (eventID + trackID) bir polyline olarak çizilir.
-    - Primary track'ler kalın çizgi, secondary track'ler daha ince ve/veya noktalı.
-    - volumeID'lerden otomatik bounding-box çıkarılıp yarı-şeffaf kutu olarak çizilebilir.
+    - Her track (eventID + trackID) polyline.
+    - Primary track'ler kalın çizgi, secondary ince / kesikli.
+    - volumeID'lerden yarı-şeffaf kutular.
+    - PDG türüne göre renk.
+    - Secondary track başlangıcına marker (verteks).
     """
 
     def __init__(self, parent=None):
-        fig = Figure(figsize=(5, 4), dpi=100)
+        fig = Figure(figsize=(5, 4), dpi=120)
         super().__init__(fig)
         self.setParent(parent)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.updateGeometry()
 
     def _draw_geometry_boxes(self, ax, volume_bounds: Dict[int, Tuple[float, float, float, float, float, float]]):
-        """
-        volumeID -> (xmin, xmax, ymin, ymax, zmin, zmax) sözlüğüne göre 3D kutular çizer.
-        """
         for vid, (xmin, xmax, ymin, ymax, zmin, zmax) in volume_bounds.items():
-            # Kutunun köşeleri
             corners = [
                 (xmin, ymin, zmin),
                 (xmax, ymin, zmin),
@@ -500,7 +568,6 @@ class TrackCanvas3D(FigureCanvas):
             ]
             poly = Poly3DCollection(faces, alpha=0.15)
             ax.add_collection3d(poly)
-            # Kutunun merkezine volumeID yaz
             cx = 0.5 * (xmin + xmax)
             cy = 0.5 * (ymin + ymax)
             cz = 0.5 * (zmin + zmax)
@@ -521,22 +588,6 @@ class TrackCanvas3D(FigureCanvas):
                     only_secondary: bool = False,
                     pdg_filter: Optional[List[int]] = None,
                     title: str = "Track Viewer"):
-        """
-        Seçilen eventID için track'leri 3D olarak çizer.
-
-        Parametreler
-        -----------
-        x,y,z : float array
-        event_id, track_id, parent_id, volume_id, pdg_id : array
-        selected_event : int
-            Hangi eventID'nin çizileceği.
-        max_tracks_to_draw : int
-            En fazla kaç farklı track çizileceği (çok kalabalık sahneleri sınırlamak için).
-        only_primary, only_secondary : bool
-            Primary/secondary filtreleri (parentID'ye göre).
-        pdg_filter : Optional[List[int]]
-            Sadece belirli PDG ID'leri çizmek için.
-        """
         self.figure.clear()
         ax = self.figure.add_subplot(111, projection="3d")
 
@@ -558,7 +609,6 @@ class TrackCanvas3D(FigureCanvas):
         if pdg_id is not None:
             pdg_id = np.asarray(pdg_id, dtype=int)
 
-        # Seçilen event için maske
         mask_ev = (event_id == selected_event)
         if not np.any(mask_ev):
             ax.set_title(f"EventID={selected_event} için adım bulunamadı.")
@@ -573,7 +623,6 @@ class TrackCanvas3D(FigureCanvas):
         par_ev = parent_id[mask_ev] if parent_id is not None else None
         vol_ev = volume_id[mask_ev] if volume_id is not None else None
 
-        # PDG filtresi
         if pdg_filter and (pid_ev is not None):
             mask_pdg = np.isin(pid_ev, np.array(pdg_filter, dtype=int))
             x_ev, y_ev, z_ev = x_ev[mask_pdg], y_ev[mask_pdg], z_ev[mask_pdg]
@@ -585,7 +634,6 @@ class TrackCanvas3D(FigureCanvas):
             if pid_ev is not None:
                 pid_ev = pid_ev[mask_pdg]
 
-        # Primary / secondary filtresi
         if par_ev is not None:
             if only_primary and not only_secondary:
                 mask_prim = (par_ev == 0)
@@ -615,7 +663,6 @@ class TrackCanvas3D(FigureCanvas):
         if unique_tracks.size > max_tracks_to_draw:
             unique_tracks = unique_tracks[:max_tracks_to_draw]
 
-        # Volume bounding-box (geometri overlay)
         if vol_ev is not None:
             volume_bounds: Dict[int, Tuple[float, float, float, float, float, float]] = {}
             for vid in np.unique(vol_ev):
@@ -628,7 +675,6 @@ class TrackCanvas3D(FigureCanvas):
                 xmin, xmax = float(np.min(xv)), float(np.max(xv))
                 ymin, ymax = float(np.min(yv)), float(np.max(yv))
                 zmin, zmax = float(np.min(zv)), float(np.max(zv))
-                # Çok ince bounding box'ları biraz şişir
                 if np.isclose(xmin, xmax):
                     delta = 0.5
                     xmin -= delta
@@ -642,10 +688,9 @@ class TrackCanvas3D(FigureCanvas):
                     zmin -= delta
                     zmax += delta
                 volume_bounds[int(vid)] = (xmin, xmax, ymin, ymax, zmin, zmax)
-
             self._draw_geometry_boxes(ax, volume_bounds)
 
-        # Track çizimi
+        legend_done: Dict[int, bool] = {}
         for tid in unique_tracks:
             m_t = (tid_ev == tid)
             x_t = x_ev[m_t]
@@ -655,26 +700,52 @@ class TrackCanvas3D(FigureCanvas):
             if x_t.size < 2:
                 continue
 
-            # Step sırasına göre sort edelim (yaklaşık bir sıra, stepIndex'i kullanmak istersek GUI'de ayrıca verilebilir)
-            # Burada sadece Z'ye göre sıralıyoruz (boşlukta monotonic olacağı varsayımı).
             order = np.argsort(z_t)
             x_t = x_t[order]
             y_t = y_t[order]
             z_t = z_t[order]
 
+            if pid_ev is not None:
+                pid_t = pid_ev[m_t][order][0]
+                color = pdg_color(pid_t)
+                label = None
+                if pid_t not in legend_done:
+                    label = pdg_name(pid_t)
+                    legend_done[pid_t] = True
+            else:
+                color = None
+                label = None
+                pid_t = None
+
             if par_ev is not None:
-                par_for_track = par_ev[m_t][0]
+                par_for_track = par_ev[m_t][order][0]
                 if par_for_track == 0:
-                    lw = 2.0
+                    lw = 2.3
                     ls = "-"
                 else:
-                    lw = 1.0
+                    lw = 1.2
                     ls = "--"
             else:
+                par_for_track = 0
                 lw = 1.5
                 ls = "-"
 
-            ax.plot(x_t, y_t, z_t, linewidth=lw, linestyle=ls)
+            ax.plot(x_t, y_t, z_t, linewidth=lw, linestyle=ls, color=color, label=label)
+
+            if par_for_track != 0:
+                x0, y0, z0 = x_t[0], y_t[0], z_t[0]
+                ax.scatter(
+                    [x0],
+                    [y0],
+                    [z0],
+                    s=40,
+                    color=color,
+                    edgecolors="k",
+                    alpha=0.9,
+                )
+
+        if legend_done:
+            ax.legend(title="Parçacık türü", fontsize=8)
 
         ax.set_xlabel("X [mm]")
         ax.set_ylabel("Y [mm]")
@@ -688,17 +759,19 @@ class TrackCanvas3D(FigureCanvas):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Geant4 Shielding Analyzer GUI (Tracks + Geometry Overlay)")
-        self.resize(1800, 950)
+        self.setWindowTitle("Geant4 Shielding Analyzer GUI (Multi-Plot + Tracks + PDG)")
+        self.resize(1900, 960)
 
+        # Zayıflama için
         self.total_outputs: List[float] = []
         self.thickness_list: List[float] = []
         self.file_names: List[str] = []
 
+        # Çıktı özetleri
         self.particle_dose_summary: Dict[int, float] = {}
         self.volume_dose_summary: Dict[int, Tuple[float, int]] = {}
 
-        # Track viewer için son dosyadan gelen full arrays
+        # Track viewer cache
         self.track_last_x = None
         self.track_last_y = None
         self.track_last_z = None
@@ -708,12 +781,17 @@ class MainWindow(QMainWindow):
         self.track_last_volume = None
         self.track_last_pdg = None
 
+        # Çoklu enerji/depth/2D için bellek
+        self.energy_results = []  # list of dict: {file, thickness, centers, hist}
+        self.depth_results = []   # list of dict: {file, thickness, z_centers, dose}
+        self.dose2d_results = []  # list of dict: {file, thickness, H, xedges, zedges}
+
+        # Ana layout
         central = QWidget()
         self.setCentralWidget(central)
-
         main_layout = QHBoxLayout(central)
 
-        # Sol panel
+        # Sol panel -----------------------------------------------------------
         left_widget = QWidget()
         left_layout = QVBoxLayout(left_widget)
 
@@ -755,7 +833,7 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(thickness_label)
         left_layout.addWidget(self.thickness_spin)
 
-        # Orta panel
+        # Orta panel ---------------------------------------------------------
         middle_widget = QWidget()
         middle_layout = QVBoxLayout(middle_widget)
 
@@ -786,6 +864,13 @@ class MainWindow(QMainWindow):
         self.nz_2d_spin.setRange(10, 400)
         self.nz_2d_spin.setValue(80)
 
+        # Grafik başlıkları
+        self.energy_title_edit = QLineEdit("Enerji Spektrumu")
+        self.depth_title_edit = QLineEdit("Derinlik-Doz Profili")
+        self.atten_title_edit = QLineEdit("Attenuation Curve (Total ΣEdep as I)")
+        self.dose2d_title_edit = QLineEdit("2D Doz Haritası (X-Z)")
+        self.hit3d_title_edit = QLineEdit("3D Hit Haritası")
+
         form.addRow("TTree adı:", self.tree_edit)
         form.addRow("Edep branch adı:", self.edep_edit)
         form.addRow("X branch adı (opsiyonel):", self.x_edit)
@@ -800,8 +885,14 @@ class MainWindow(QMainWindow):
         form.addRow("Derinlik-doz bin sayısı:", self.nbins_depth_spin)
         form.addRow("2D doz haritası X bin sayısı:", self.nx_2d_spin)
         form.addRow("2D doz haritası Z bin sayısı:", self.nz_2d_spin)
+        form.addRow(QLabel("---- Grafik Başlıkları ----"))
+        form.addRow("Enerji grafiği başlığı:", self.energy_title_edit)
+        form.addRow("Derinlik-doz başlığı:", self.depth_title_edit)
+        form.addRow("Attenuation başlığı:", self.atten_title_edit)
+        form.addRow("2D doz başlığı:", self.dose2d_title_edit)
+        form.addRow("3D hit başlığı:", self.hit3d_title_edit)
 
-        # Çıkış yüzeyi Z aralığı
+        # Çıkış yüzeyi
         self.use_zrange_cb = QCheckBox("I hesabı için çıkış yüzeyi Z aralığı kullan")
         self.zmin_out_spin = QDoubleSpinBox()
         self.zmin_out_spin.setRange(-1e6, 1e6)
@@ -816,19 +907,18 @@ class MainWindow(QMainWindow):
         form.addRow("Z_min (çıkış yüzeyi):", self.zmin_out_spin)
         form.addRow("Z_max (çıkış yüzeyi):", self.zmax_out_spin)
 
-        # Parçacık filtresi
+        # PDG / volume filtresi
         self.use_pid_filter_cb = QCheckBox("Sadece seçilen PDG ID'leri analiz et")
         self.pid_list_edit = QLineEdit("")
         form.addRow(self.use_pid_filter_cb)
         form.addRow("PDG ID listesi (virgülle):", self.pid_list_edit)
 
-        # Volume filtresi
         self.use_volume_filter_cb = QCheckBox("Sadece seçilen volumeID'leri analiz et")
         self.volume_list_edit = QLineEdit("")
         form.addRow(self.use_volume_filter_cb)
         form.addRow("Volume ID listesi (virgülle):", self.volume_list_edit)
 
-        # Track viewer filtreleri
+        # Track viewer ayarları
         self.track_event_spin = QSpinBox()
         self.track_event_spin.setRange(0, 1_000_000)
         self.track_event_spin.setValue(0)
@@ -872,41 +962,77 @@ class MainWindow(QMainWindow):
         middle_layout.addWidget(QLabel("Log:"))
         middle_layout.addWidget(self.log_edit)
 
-        # Sağ panel: grafikler + özet
+        # Sağ panel -----------------------------------------------------------
         right_widget = QWidget()
         right_layout = QVBoxLayout(right_widget)
 
         self.tabs = QTabWidget()
-        # Enerji
-        self.energy_canvas = PlotCanvas()
+
+        # Enerji sekmesi: Tekil + Kıyaslama alt sekmeleri
+        self.energy_tab = QTabWidget()
+        self.energy_canvas_single = PlotCanvas()
+        self.energy_canvas_multi = PlotCanvas()
+        energy_single_widget = QWidget()
+        evs_layout = QVBoxLayout(energy_single_widget)
+        evs_layout.addWidget(self.energy_canvas_single)
+        energy_multi_widget = QWidget()
+        evm_layout = QVBoxLayout(energy_multi_widget)
+        evm_layout.addWidget(self.energy_canvas_multi)
+        self.energy_tab.addTab(energy_single_widget, "Tekil grafik")
+        self.energy_tab.addTab(energy_multi_widget, "Kıyaslama (tüm dosyalar)")
         energy_widget = QWidget()
         ev_layout = QVBoxLayout(energy_widget)
-        ev_layout.addWidget(self.energy_canvas)
+        ev_layout.addWidget(self.energy_tab)
         self.tabs.addTab(energy_widget, "Enerji Spektrumu")
-        # Derinlik-doz
-        self.depth_canvas = PlotCanvas()
+
+        # Derinlik-doz: Tekil + Kıyaslama
+        self.depth_tab = QTabWidget()
+        self.depth_canvas_single = PlotCanvas()
+        self.depth_canvas_multi = PlotCanvas()
+        depth_single_widget = QWidget()
+        dps_layout = QVBoxLayout(depth_single_widget)
+        dps_layout.addWidget(self.depth_canvas_single)
+        depth_multi_widget = QWidget()
+        dpm_layout = QVBoxLayout(depth_multi_widget)
+        dpm_layout.addWidget(self.depth_canvas_multi)
+        self.depth_tab.addTab(depth_single_widget, "Tekil grafik")
+        self.depth_tab.addTab(depth_multi_widget, "Kıyaslama (tüm dosyalar)")
         depth_widget = QWidget()
         dd_layout = QVBoxLayout(depth_widget)
-        dd_layout.addWidget(self.depth_canvas)
+        dd_layout.addWidget(self.depth_tab)
         self.tabs.addTab(depth_widget, "Derinlik-Doz")
+
         # Zayıflama
         self.atten_canvas = PlotCanvas()
         atten_widget = QWidget()
         at_layout = QVBoxLayout(atten_widget)
         at_layout.addWidget(self.atten_canvas)
         self.tabs.addTab(atten_widget, "Zayıflama (HVL/TVL)")
+
         # 3D hits
         self.hit3d_canvas = PlotCanvas3D()
         hit3d_widget = QWidget()
         h3_layout = QVBoxLayout(hit3d_widget)
         h3_layout.addWidget(self.hit3d_canvas)
         self.tabs.addTab(hit3d_widget, "3D Hit Haritası")
-        # 2D doz
-        self.dose2d_canvas = PlotCanvas()
+
+        # 2D doz: tekil + birleşik (toplam)
+        self.dose2d_tab = QTabWidget()
+        self.dose2d_canvas_single = PlotCanvas()
+        self.dose2d_canvas_multi = PlotCanvas()
+        dose2d_single_widget = QWidget()
+        d2s_layout = QVBoxLayout(dose2d_single_widget)
+        d2s_layout.addWidget(self.dose2d_canvas_single)
+        dose2d_multi_widget = QWidget()
+        d2m_layout = QVBoxLayout(dose2d_multi_widget)
+        d2m_layout.addWidget(self.dose2d_canvas_multi)
+        self.dose2d_tab.addTab(dose2d_single_widget, "Tekil harita (son dosya)")
+        self.dose2d_tab.addTab(dose2d_multi_widget, "Birleşik harita (sum)")
         dose2d_widget = QWidget()
         d2_layout = QVBoxLayout(dose2d_widget)
-        d2_layout.addWidget(self.dose2d_canvas)
+        d2_layout.addWidget(self.dose2d_tab)
         self.tabs.addTab(dose2d_widget, "2D Doz Haritası (X-Z)")
+
         # Özet
         self.summary_table = QTableWidget(0, 4)
         self.summary_table.setHorizontalHeaderLabels(["Dosya", "Kalınlık [mm]", "ΣEdep", "I/I0"])
@@ -914,13 +1040,15 @@ class MainWindow(QMainWindow):
         s_layout = QVBoxLayout(summary_widget)
         s_layout.addWidget(self.summary_table)
         self.tabs.addTab(summary_widget, "Özet")
+
         # Parçacık özeti
-        self.particle_table = QTableWidget(0, 3)
-        self.particle_table.setHorizontalHeaderLabels(["PDG ID", "ΣEdep", "Toplam İçindeki Payı"])
+        self.particle_table = QTableWidget(0, 4)
+        self.particle_table.setHorizontalHeaderLabels(["PDG ID", "İsim", "ΣEdep", "Toplam İçindeki Payı"])
         particle_widget = QWidget()
         p_layout = QVBoxLayout(particle_widget)
         p_layout.addWidget(self.particle_table)
         self.tabs.addTab(particle_widget, "Parçacık Özeti")
+
         # Volume özeti
         self.volume_table = QTableWidget(0, 4)
         self.volume_table.setHorizontalHeaderLabels(
@@ -930,6 +1058,7 @@ class MainWindow(QMainWindow):
         v_layout = QVBoxLayout(volume_widget)
         v_layout.addWidget(self.volume_table)
         self.tabs.addTab(volume_widget, "Volume Özeti")
+
         # Track viewer
         self.track_canvas = TrackCanvas3D()
         track_widget = QWidget()
@@ -938,7 +1067,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(track_widget, "Track Viewer")
 
         self.energy_log_cb = QCheckBox("Enerji spektrumu için log Y ekseni")
-        self.energy_log_cb.stateChanged.connect(self.redraw_last_energy)
+        self.energy_log_cb.stateChanged.connect(self.redraw_energy_plots)
 
         right_layout.addWidget(self.energy_log_cb)
         right_layout.addWidget(self.tabs)
@@ -947,11 +1076,10 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(middle_widget, 3)
         main_layout.addWidget(right_widget, 7)
 
-        # Enerji grafiği için cache
-        self._last_energy_centers = None
-        self._last_energy_hist = None
-        self._last_energy_xlabel = ""
-        self._last_energy_title = ""
+        # Son çizimlerin cache'i (tekil)
+        self._last_energy_single = None
+        self._last_depth_single = None
+        self._last_2d_single = None
 
     # ---------- Yardımcılar ----------
 
@@ -1182,6 +1310,7 @@ class MainWindow(QMainWindow):
         if use_volume_filter:
             self.log(f"Volume filtresi aktif. Volume ID'ler: {volume_list}")
 
+        # Global özetleri sıfırla
         self.total_outputs = []
         self.thickness_list = []
         self.file_names = []
@@ -1191,7 +1320,7 @@ class MainWindow(QMainWindow):
         self.particle_table.setRowCount(0)
         self.volume_table.setRowCount(0)
 
-        # Track viewer cache sıfırla
+        # Track cache sıfırla
         self.track_last_x = None
         self.track_last_y = None
         self.track_last_z = None
@@ -1201,19 +1330,19 @@ class MainWindow(QMainWindow):
         self.track_last_volume = None
         self.track_last_pdg = None
 
+        # Çoklu grafik belleklerini sıfırla
+        self.energy_results.clear()
+        self.depth_results.clear()
+        self.dose2d_results.clear()
+
         out_dir = os.getcwd()
 
-        last_centers = None
-        last_hist = None
-        last_z_centers = None
-        last_dose = None
-        last_x = None
-        last_y = None
-        last_z = None
-        last_edep_for_3d = None
-        last_H2d = None
-        last_xedges = None
-        last_zedges = None
+        # Tekil grafik cache
+        self._last_energy_single = None
+        self._last_depth_single = None
+        self._last_2d_single = None
+
+        last_x = last_y = last_z = last_edep_for_3d = None
 
         for idx in range(n_items):
             item = self.file_list.item(idx)
@@ -1258,21 +1387,19 @@ class MainWindow(QMainWindow):
             z_branch = z_branch_user
             if x_branch is None or y_branch is None or z_branch is None:
                 if all_branches:
-                    ax, ay, az = autodetect_xyz_branches(all_branches)
-                    if x_branch is None and ax is not None:
-                        x_branch = ax
+                    ax_b, ay_b, az_b = autodetect_xyz_branches(all_branches)
+                    if x_branch is None and ax_b is not None:
+                        x_branch = ax_b
                         self.log(f"  -> X branch auto-detect: {x_branch}")
-                    if y_branch is None and ay is not None:
-                        y_branch = ay
+                    if y_branch is None and ay_b is not None:
+                        y_branch = ay_b
                         self.log(f"  -> Y branch auto-detect: {y_branch}")
-                    if z_branch is None and az is not None:
-                        z_branch = az
+                    if z_branch is None and az_b is not None:
+                        z_branch = az_b
                         self.log(f"  -> Z branch auto-detect: {z_branch}")
 
             # X,Y,Z, PID, Volume, Event, Track, Parent
-            x_arr_raw = None
-            y_arr_raw = None
-            z_arr_raw = None
+            x_arr_raw = y_arr_raw = z_arr_raw = None
             if x_branch is not None:
                 try:
                     x_arr_raw = get_branch(tree, x_branch)
@@ -1387,27 +1514,26 @@ class MainWindow(QMainWindow):
                 volume_arr = volume_arr[mask_v]
                 self.log(f"  -> Volume filtresi sonrası event sayısı: {np.count_nonzero(mask_v)}")
 
-            # Enerji spektrumu
+            # Enerji spektrumu (tekil)
             centers, hist = make_energy_spectrum(edep, nbins=nbins_edep)
-            last_centers, last_hist = centers, hist
+            self.energy_results.append(
+                {"file": base, "thickness": thickness_mm, "centers": centers, "hist": hist}
+            )
+            self._last_energy_single = (centers, hist, base)
 
-            self._last_energy_centers = centers
-            self._last_energy_hist = hist
-            self._last_energy_xlabel = f"{edep_branch} [a.u.]"
-            self._last_energy_title = f"Energy Spectrum - {base}"
-
-            self.energy_canvas.plot_energy(
-                centers,
-                hist,
-                title=self._last_energy_title,
-                xlabel=self._last_energy_xlabel,
+            energy_title = self.energy_title_edit.text().strip() or "Enerji Spektrumu"
+            xlabel_e = f"{edep_branch} [a.u.]"
+            self.energy_canvas_single.plot_energy(
+                centers, [hist], [f"{base} ({thickness_mm:.1f} mm)"],
+                title=f"{energy_title} - {base}",
+                xlabel=xlabel_e,
                 ylog=self.energy_log_cb.isChecked(),
             )
 
             png_edep = os.path.join(out_dir, f"{base}_EdepSpectrum.png")
             csv_edep = os.path.join(out_dir, f"{base}_EdepSpectrum.csv")
             try:
-                self.energy_canvas.figure.savefig(png_edep, dpi=300)
+                self.energy_canvas_single.figure.savefig(png_edep, dpi=300)
                 data_edep = np.vstack([centers, hist]).T
                 save_csv(csv_edep, "E_center,Counts", data_edep)
                 self.log(f"  -> Enerji spektrumu kaydedildi: {png_edep}, {csv_edep}")
@@ -1415,26 +1541,31 @@ class MainWindow(QMainWindow):
                 self.log(f"[UYARI] Enerji spektrumu kaydedilemedi: {e}")
 
             # Derinlik-doz
+            z_centers = dose = None
             if z_arr is not None:
                 z_centers, dose = make_depth_dose(z_arr, edep, nbins=nbins_depth)
-                last_z_centers, last_dose = z_centers, dose
-                self.depth_canvas.plot_depth_dose(
-                    z_centers,
-                    dose,
-                    title=f"Depth-Dose - {base}",
+                self.depth_results.append(
+                    {"file": base, "thickness": thickness_mm, "z_centers": z_centers, "dose": dose}
+                )
+                self._last_depth_single = (z_centers, dose, base)
+                depth_title = self.depth_title_edit.text().strip() or "Derinlik-Doz Profili"
+                self.depth_canvas_single.plot_depth_dose(
+                    [z_centers], [dose],
+                    [f"{base} ({thickness_mm:.1f} mm)"],
+                    title=f"{depth_title} - {base}",
                     xlabel=z_branch or "Z",
                 )
                 png_dd = os.path.join(out_dir, f"{base}_DepthDose.png")
                 csv_dd = os.path.join(out_dir, f"{base}_DepthDose.csv")
                 try:
-                    self.depth_canvas.figure.savefig(png_dd, dpi=300)
+                    self.depth_canvas_single.figure.savefig(png_dd, dpi=300)
                     data_dd = np.vstack([z_centers, dose]).T
                     save_csv(csv_dd, "Z_center,Dose_sumEdep", data_dd)
                     self.log(f"  -> Derinlik-doz kaydedildi: {png_dd}, {csv_dd}")
                 except Exception as e:
                     self.log(f"[UYARI] Derinlik-doz kaydedilemedi: {e}")
 
-            # 3D hit haritası
+            # 3D hit haritası (son dosya)
             if (x_arr is not None) and (y_arr is not None) and (z_arr is not None):
                 max_points = 8000
                 if x_arr.size > max_points:
@@ -1452,12 +1583,13 @@ class MainWindow(QMainWindow):
 
                 last_x, last_y, last_z = x_plot, y_plot, z_plot
                 last_edep_for_3d = e_plot
+                hit_title = self.hit3d_title_edit.text().strip() or "3D Hit Haritası"
                 self.hit3d_canvas.plot_hits_3d(
                     x_plot,
                     y_plot,
                     z_plot,
                     edep=e_plot,
-                    title=f"3D Hits - {base}",
+                    title=f"{hit_title} - {base}",
                     xlabel=x_branch or "X",
                     ylabel=y_branch or "Y",
                     zlabel=z_branch or "Z",
@@ -1474,19 +1606,23 @@ class MainWindow(QMainWindow):
             # 2D doz haritası
             if (x_arr is not None) and (z_arr is not None):
                 H2d, xedges, zedges = make_2d_dose_map(x_arr, z_arr, edep, nx=nx_2d, nz=nz_2d)
-                last_H2d, last_xedges, last_zedges = H2d, xedges, zedges
-                self.dose2d_canvas.plot_2d_dose(
+                self.dose2d_results.append(
+                    {"file": base, "thickness": thickness_mm, "H": H2d, "xedges": xedges, "zedges": zedges}
+                )
+                self._last_2d_single = (H2d, xedges, zedges, base)
+                dose2d_title = self.dose2d_title_edit.text().strip() or "2D Doz Haritası (X-Z)"
+                self.dose2d_canvas_single.plot_2d_dose(
                     H2d,
                     xedges,
                     zedges,
-                    title=f"2D Doz Haritası (X-Z) - {base}",
+                    title=f"{dose2d_title} - {base}",
                     xlabel=x_branch or "X",
                     ylabel=z_branch or "Z",
                 )
                 png_2d = os.path.join(out_dir, f"{base}_DoseMap_XZ.png")
                 csv_2d = os.path.join(out_dir, f"{base}_DoseMap_XZ.csv")
                 try:
-                    self.dose2d_canvas.figure.savefig(png_2d, dpi=300)
+                    self.dose2d_canvas_single.figure.savefig(png_2d, dpi=300)
                     with open(csv_2d, "w", encoding="utf-8") as fcsv:
                         fcsv.write("# X edges:\n")
                         fcsv.write(",".join(str(v) for v in xedges) + "\n")
@@ -1529,7 +1665,7 @@ class MainWindow(QMainWindow):
                     total_dose, total_count = self.volume_dose_summary.get(vid, (0.0, 0))
                     self.volume_dose_summary[vid] = (total_dose + dose_v, total_count + count_v)
 
-            # Track viewer için son dosyanın full verisini cache'e al
+            # Track viewer cache (son dosya)
             if (event_arr is not None) and (track_arr is not None) and (x_arr is not None) and (y_arr is not None) and (z_arr is not None):
                 self.track_last_x = x_arr
                 self.track_last_y = y_arr
@@ -1539,7 +1675,6 @@ class MainWindow(QMainWindow):
                 self.track_last_parent = parent_arr
                 self.track_last_volume = volume_arr
                 self.track_last_pdg = pid_arr
-                # Varsayılan olarak en küçük eventID'yi viewer'a yaz
                 try:
                     ev_min = int(np.min(event_arr))
                     self.track_event_spin.setValue(ev_min)
@@ -1549,52 +1684,10 @@ class MainWindow(QMainWindow):
 
             QApplication.processEvents()
 
-        # Son çizilenler
-        if last_centers is not None and last_hist is not None:
-            self._last_energy_centers = last_centers
-            self._last_energy_hist = last_hist
-            self._last_energy_xlabel = f"{edep_branch} [a.u.]"
-            self._last_energy_title = "Son dosyanın Enerji Spektrumu"
-            self.energy_canvas.plot_energy(
-                last_centers,
-                last_hist,
-                title=self._last_energy_title,
-                xlabel=self._last_energy_xlabel,
-                ylog=self.energy_log_cb.isChecked(),
-            )
-
-        if last_z_centers is not None and last_dose is not None and (z_branch_user or z_branch):
-            self.depth_canvas.plot_depth_dose(
-                last_z_centers,
-                last_dose,
-                title="Son dosyanın Derinlik-Doz Profili",
-                xlabel=z_branch or z_branch_user or "Z",
-            )
-
-        if (last_x is not None) and (last_y is not None) and (last_z is not None):
-            self.hit3d_canvas.plot_hits_3d(
-                last_x,
-                last_y,
-                last_z,
-                edep=last_edep_for_3d,
-                title="Son dosyanın 3D Hit Haritası",
-            )
-        else:
-            self.hit3d_canvas.plot_hits_3d(
-                None,
-                None,
-                None,
-                edep=None,
-                title="3D Hit Haritası (X/Y/Z bulunamadı veya boş)",
-            )
-
-        if (last_H2d is not None) and (last_xedges is not None) and (last_zedges is not None):
-            self.dose2d_canvas.plot_2d_dose(
-                last_H2d,
-                last_xedges,
-                last_zedges,
-                title="Son dosyanın 2D Doz Haritası (X-Z)",
-            )
+        # Çoklu grafikler (kıyaslama) --------------------------------------
+        self.update_energy_multi_plot(edep_branch)
+        self.update_depth_multi_plot(z_branch_user or z_branch)
+        self.update_dose2d_multi_plot(x_branch_user or x_branch, z_branch_user or z_branch)
 
         # Özet tablolar
         self.update_summary_table(None)
@@ -1604,22 +1697,160 @@ class MainWindow(QMainWindow):
         # HVL/TVL
         self.run_attenuation_analysis(out_dir)
 
-        # Track viewer'ı varsayılan event için güncelle
+        # Track viewer'ı güncelle
         self.update_track_viewer_from_ui()
+
+        # 3D hit haritası, son dosya tekrar çizimi (başlık uyumlu)
+        if (last_x is not None) and (last_y is not None) and (last_z is not None):
+            hit_title = self.hit3d_title_edit.text().strip() or "3D Hit Haritası"
+            self.hit3d_canvas.plot_hits_3d(
+                last_x, last_y, last_z,
+                edep=last_edep_for_3d,
+                title=hit_title,
+            )
+        else:
+            self.hit3d_canvas.plot_hits_3d(None, None, None, edep=None, title="3D Hit Haritası (X/Y/Z yok)")
 
         self.log("=== Analiz tamamlandı ===")
         self.log("Not: 3D veya Track grafiğini göremiyorsan log'daki 'X/Y/Z eksik' mesajına bakıp branch isimlerini düzelt.")
 
-    def redraw_last_energy(self):
-        if self._last_energy_centers is None or self._last_energy_hist is None:
+    # ---------- Çoklu grafik güncellemeleri ----------
+
+    def redraw_energy_plots(self):
+        """Y ekseni log/linear değişince enerji grafiğini yeniden çiz."""
+        # Tekil
+        if self._last_energy_single is not None:
+            centers, hist, base = self._last_energy_single
+            title = self.energy_title_edit.text().strip() or "Enerji Spektrumu"
+            xlabel_e = f"{self.edep_edit.text().strip() or 'Edep'} [a.u.]"
+            self.energy_canvas_single.plot_energy(
+                centers, [hist], [f"{base}"],
+                title=f"{title} - {base}",
+                xlabel=xlabel_e,
+                ylog=self.energy_log_cb.isChecked(),
+            )
+        # Çoklu
+        self.update_energy_multi_plot(self.edep_edit.text().strip() or "Edep")
+
+    def update_energy_multi_plot(self, edep_branch: str):
+        """Tüm dosyaların enerji spektrumlarını tek grafikte kıyaslama."""
+        if not self.energy_results:
+            self.energy_canvas_multi.figure.clear()
+            self.energy_canvas_multi.draw()
             return
-        self.energy_canvas.plot_energy(
-            self._last_energy_centers,
-            self._last_energy_hist,
-            title=self._last_energy_title or "Energy Spectrum",
-            xlabel=self._last_energy_xlabel or "Edep [a.u.]",
+
+        # Ortak x ekseni için interpolation
+        x_min = min(res["centers"][0] for res in self.energy_results if res["centers"].size > 0)
+        x_max = max(res["centers"][-1] for res in self.energy_results if res["centers"].size > 0)
+        if not np.isfinite(x_min) or not np.isfinite(x_max) or x_max <= x_min:
+            x_min, x_max = 0.0, 1.0
+        x_common = np.linspace(x_min, x_max, 400)
+
+        hist_list = []
+        labels = []
+        centers_list = []
+        for res in self.energy_results:
+            c = res["centers"]
+            h = res["hist"]
+            if c.size == 0:
+                continue
+            y_interp = np.interp(x_common, c, h)
+            hist_list.append(y_interp)
+            centers_list.append(x_common)
+            labels.append(f"{res['file']} ({res['thickness']:.1f} mm)")
+
+        if not hist_list:
+            self.energy_canvas_multi.figure.clear()
+            self.energy_canvas_multi.draw()
+            return
+
+        title = self.energy_title_edit.text().strip() or "Enerji Spektrumu"
+        xlabel_e = f"{edep_branch} [a.u.]"
+        self.energy_canvas_multi.plot_energy(
+            centers_list,
+            hist_list,
+            labels,
+            title=f"{title} - Kıyaslama",
+            xlabel=xlabel_e,
             ylog=self.energy_log_cb.isChecked(),
         )
+
+    def update_depth_multi_plot(self, z_branch: Optional[str]):
+        if not self.depth_results:
+            self.depth_canvas_multi.figure.clear()
+            self.depth_canvas_multi.draw()
+            return
+
+        z_list = []
+        dose_list = []
+        labels = []
+        for res in self.depth_results:
+            zc = res["z_centers"]
+            d = res["dose"]
+            if zc is None or len(zc) == 0:
+                continue
+            z_list.append(zc)
+            dose_list.append(d)
+            labels.append(f"{res['file']} ({res['thickness']:.1f} mm)")
+
+        if not z_list:
+            self.depth_canvas_multi.figure.clear()
+            self.depth_canvas_multi.draw()
+            return
+
+        title = self.depth_title_edit.text().strip() or "Derinlik-Doz Profili"
+        xlabel = z_branch or "Z"
+        self.depth_canvas_multi.plot_depth_dose(
+            z_list,
+            dose_list,
+            labels,
+            title=f"{title} - Kıyaslama",
+            xlabel=xlabel,
+        )
+
+    def update_dose2d_multi_plot(self, x_branch: Optional[str], z_branch: Optional[str]):
+        """Tüm dosyalardaki 2D doz haritalarının toplamını göster."""
+        if not self.dose2d_results:
+            self.dose2d_canvas_multi.figure.clear()
+            self.dose2d_canvas_multi.draw()
+            return
+
+        # Basit yaklaşım: ilk dosyanın gridine yeniden ölçeklenmeden sum
+        # (NX/NZ aynı olduğu sürece makul)
+        H_acc = None
+        xedges = None
+        zedges = None
+        for res in self.dose2d_results:
+            H = res["H"]
+            xe = res["xedges"]
+            ze = res["zedges"]
+            if H_acc is None:
+                H_acc = H.copy()
+                xedges = xe
+                zedges = ze
+            else:
+                if H.shape == H_acc.shape:
+                    H_acc += H
+                else:
+                    # Grid farklıysa bu dosyayı es geç
+                    continue
+
+        if H_acc is None or xedges is None or zedges is None:
+            self.dose2d_canvas_multi.figure.clear()
+            self.dose2d_canvas_multi.draw()
+            return
+
+        dose2d_title = self.dose2d_title_edit.text().strip() or "2D Doz Haritası (X-Z)"
+        self.dose2d_canvas_multi.plot_2d_dose(
+            H_acc,
+            xedges,
+            zedges,
+            title=f"{dose2d_title} - Birleşik (sum)",
+            xlabel=x_branch or "X",
+            ylabel=z_branch or "Z",
+        )
+
+    # ---------- Özetler ve HVL/TVL ----------
 
     def update_summary_table(self, I_norm_full: Optional[np.ndarray]):
         n = len(self.file_names)
@@ -1654,8 +1885,9 @@ class MainWindow(QMainWindow):
             dose = summary[pdg]
             frac = dose / total_all if total_all > 0.0 else 0.0
             self.particle_table.setItem(i, 0, QTableWidgetItem(str(pdg)))
-            self.particle_table.setItem(i, 1, QTableWidgetItem(f"{dose:.6e}"))
-            self.particle_table.setItem(i, 2, QTableWidgetItem(f"{frac:.4f}"))
+            self.particle_table.setItem(i, 1, QTableWidgetItem(pdg_name(pdg)))
+            self.particle_table.setItem(i, 2, QTableWidgetItem(f"{dose:.6e}"))
+            self.particle_table.setItem(i, 3, QTableWidgetItem(f"{frac:.4f}"))
         self.particle_table.resizeColumnsToContents()
 
     def update_volume_summary_table(self):
@@ -1704,6 +1936,7 @@ class MainWindow(QMainWindow):
         I_fit = fit_curve[1]
         I_fit_norm = I_fit / I0
 
+        atten_title = self.atten_title_edit.text().strip() or "Attenuation Curve (Total ΣEdep as I)"
         self.atten_canvas.plot_attenuation(
             t_valid,
             I_norm_valid,
@@ -1712,7 +1945,7 @@ class MainWindow(QMainWindow):
             mu,
             HVL,
             TVL,
-            title="Attenuation Curve (Total ΣEdep as I)",
+            title=atten_title,
         )
 
         png_att = os.path.join(out_dir, "AttenuationCurve.png")
