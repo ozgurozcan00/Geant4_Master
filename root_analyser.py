@@ -1,0 +1,1782 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Geant4 ROOT zırhlama analiz GUI'si (PyQt5 + uproot + matplotlib)
+Gelişmiş Sürüm: 3D/2D + Parçacık Özeti + Volume Özeti + Track Viewer + Geometri Overlay.
+
+Özellik özet:
+- ROOT ntuple'larından (Hits TTree'si) şu analizleri yapar:
+    * Enerji spektrumu (Edep histogramı)
+    * Derinlik-doz (Z vs ΣEdep)
+    * Zayıflama eğrisi (ΣEdep vs kalınlık -> µ, HVL, TVL)
+    * 3D hit haritası (X,Y,Z, renk=Edep)
+    * 2D doz haritası (X–Z ΣEdep heatmap)
+    * Parçacık (PDG) bazlı doz özeti
+    * Volume (region) bazlı doz özeti (volumeID branch'i üzerinden)
+    * Özet tablosu (dosya, kalınlık, ΣEdep, I/I0)
+- Track destekli veri varsa (eventID, trackID, parentID, stepIndex):
+    * Yeni sekme: "Track Viewer"
+    * Seçilen eventID için:
+        - Tüm track'ler, primary/secondary ayrımı ile çizilir.
+        - Primary track'ler kalın çizgi, secondary'ler ince çizgi/veya noktalı.
+        - volumeID'lere göre yarı-şeffaf kutu geometri overlay'i (data'dan otomatik bounding box).
+    * Event seçimi için spinbox: "Görüntülenecek EventID"
+    * Sadece primary, sadece secondary, belirli PDG seti gibi filtreler uygulanabilir.
+
+ROOT gerektirmez, sadece:
+    pip install pyqt5 uproot matplotlib numpy
+yeterli.
+"""
+
+import sys
+import os
+import re
+from typing import List, Tuple, Optional, Dict
+
+import numpy as np
+import uproot
+
+import matplotlib
+matplotlib.use("Qt5Agg")
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
+
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
+from PyQt5.QtWidgets import (
+    QApplication,
+    QMainWindow,
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QPushButton,
+    QFileDialog,
+    QListWidget,
+    QListWidgetItem,
+    QLineEdit,
+    QLabel,
+    QFormLayout,
+    QSpinBox,
+    QDoubleSpinBox,
+    QTextEdit,
+    QTabWidget,
+    QMessageBox,
+    QSizePolicy,
+    QCheckBox,
+    QTableWidget,
+    QTableWidgetItem,
+)
+from PyQt5.QtCore import Qt
+
+
+# ---------- Yardımcı: dosya adından kalınlık çıkarma ----------
+
+def infer_thickness_from_filename(basename: str) -> Optional[float]:
+    """Dosya adından kalınlığı tahmin et. Örn: shield_010mm.root -> 10.0"""
+    m = re.search(r"(\d+(?:\.\d*)?)mm", basename, flags=re.IGNORECASE)
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except ValueError:
+        return None
+
+
+# ---------- Veri işleme fonksiyonları ----------
+
+def read_tree(filename: str, tree_name: str):
+    """ROOT dosyasından belirtilen TTree'yi döndür (hata durumunda Exception)."""
+    f = uproot.open(filename)
+    keys = list(f.keys())
+    clean_keys = [k.split(";")[0] for k in keys]
+
+    ttree_names = []
+    for k, obj in f.items():
+        if isinstance(obj, uproot.behaviors.TTree.TTree):
+            ttree_names.append(k.split(";")[0])
+
+    if tree_name not in clean_keys:
+        msg_lines = [
+            f"'{filename}' içinde '{tree_name}' isimli TTree bulunamadı.",
+            "Mevcut TTree'ler:",
+        ]
+        if ttree_names:
+            for n in ttree_names:
+                msg_lines.append(f"  - {n}")
+        else:
+            msg_lines.append("  (Bu dosyada TTree bulunamadı)")
+        raise RuntimeError("\n".join(msg_lines))
+
+    for k in keys:
+        if k.startswith(tree_name + ";"):
+            tree = f[k]
+            if not isinstance(tree, uproot.behaviors.TTree.TTree):
+                raise RuntimeError(
+                    f"'{tree_name}' bulundu ama TTree değil (tip: {type(tree)})."
+                )
+            return tree
+
+    raise RuntimeError(f"'{tree_name}' anahtarı çözümlenemedi (ROOT key).")
+
+
+def list_ttrees_in_file(filename: str) -> List[str]:
+    """Dosyadaki TTree isimlerini döndür."""
+    f = uproot.open(filename)
+    names = []
+    for k, obj in f.items():
+        if isinstance(obj, uproot.behaviors.TTree.TTree):
+            names.append(k.split(";")[0])
+    return names
+
+
+def list_branches_in_tree(filename: str, tree_name: str) -> List[str]:
+    """Belirli bir TTree içindeki branch isimlerini döndür."""
+    tree = read_tree(filename, tree_name)
+    return list(tree.keys())
+
+
+def get_branch(tree, branch_name: str) -> np.ndarray:
+    """TTree içinden branch'i NumPy array olarak döndür (hata durumunda Exception)."""
+    try:
+        arr = tree[branch_name].array(library="np")
+    except Exception as e:
+        raise RuntimeError(
+            f"TTree içinde '{branch_name}' branch'i okunamadı: {e}\n"
+            f"Mevcut branch'leri görmek için GUI'deki 'Branch'leri listele' butonunu kullan."
+        )
+    return arr
+
+
+def make_energy_spectrum(edep: np.ndarray, nbins: int = 200,
+                         emin: Optional[float] = None,
+                         emax: Optional[float] = None) -> Tuple[np.ndarray, np.ndarray]:
+    """Enerji depoziti histogramı üret (bin merkezleri ve sayımlar)."""
+    edep = np.asarray(edep, dtype=float)
+    mask = np.isfinite(edep) & (edep >= 0.0)
+    edep = edep[mask]
+
+    if edep.size == 0:
+        return np.array([0.0, 1.0]), np.array([0.0, 0.0])
+
+    if emin is None:
+        emin = float(np.min(edep))
+    if emax is None:
+        emax = float(np.max(edep))
+
+    if np.isclose(emin, emax):
+        emax = emin + 1.0
+
+    hist, edges = np.histogram(edep, bins=nbins, range=(emin, emax))
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    return centers, hist
+
+
+def make_depth_dose(z: np.ndarray, edep: np.ndarray,
+                    nbins: int = 100,
+                    zmin: Optional[float] = None,
+                    zmax: Optional[float] = None) -> Tuple[np.ndarray, np.ndarray]:
+    """Z ekseni boyunca doz profilini üret (Z vs ΣEdep)."""
+    z = np.asarray(z, dtype=float)
+    edep = np.asarray(edep, dtype=float)
+
+    mask = np.isfinite(z) & np.isfinite(edep)
+    z = z[mask]
+    edep = edep[mask]
+
+    if z.size == 0:
+        return np.array([]), np.array([])
+
+    if zmin is None:
+        zmin = float(np.min(z))
+    if zmax is None:
+        zmax = float(np.max(z))
+
+    if np.isclose(zmin, zmax):
+        zmax = zmin + 1.0
+
+    bins = np.linspace(zmin, zmax, nbins + 1)
+    dose, edges = np.histogram(z, bins=bins, weights=edep)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    return centers, dose
+
+
+def make_2d_dose_map(x: np.ndarray, z: np.ndarray, edep: np.ndarray,
+                     nx: int = 80, nz: int = 80) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """X–Z düzleminde 2B doz haritası (histogram2d, ağırlık=Edep)."""
+    x = np.asarray(x, dtype=float)
+    z = np.asarray(z, dtype=float)
+    w = np.asarray(edep, dtype=float)
+
+    mask = np.isfinite(x) & np.isfinite(z) & np.isfinite(w)
+    x = x[mask]
+    z = z[mask]
+    w = w[mask]
+
+    if x.size == 0 or z.size == 0:
+        return np.zeros((2, 2)), np.array([0, 1]), np.array([0, 1])
+
+    H, xedges, zedges = np.histogram2d(x, z, bins=[nx, nz], weights=w)
+    return H.T, xedges, zedges
+
+
+def compute_total_output_from_window(edep: np.ndarray,
+                                     z: Optional[np.ndarray] = None,
+                                     zmin: Optional[float] = None,
+                                     zmax: Optional[float] = None) -> float:
+    """
+    Zayıflama analizi için I ~ ΣEdep.
+
+    Eğer z, zmin, zmax verilmişse:
+        - Sadece zmin <= Z <= zmax aralığındaki Edep'ler toplanır.
+    Aksi halde:
+        - Tüm Edep'ler toplanır.
+    """
+    edep = np.asarray(edep, dtype=float)
+    mask = np.isfinite(edep)
+
+    if z is not None and zmin is not None and zmax is not None and zmax > zmin:
+        z = np.asarray(z, dtype=float)
+        mask = mask & np.isfinite(z) & (z >= zmin) & (z <= zmax)
+
+    return float(np.sum(edep[mask]))
+
+
+def fit_attenuation(thickness_mm: List[float],
+                    outputs: List[float]) -> Tuple[float, float, float, np.ndarray, float, np.ndarray]:
+    """
+    Kalınlık (mm) ve çıkış şiddeti (I) için log-lineer fit ile µ, HVL, TVL hesapla.
+
+    ln(I/I0) = a + b * d  ->  µ = -b
+    HVL = ln(2)/µ, TVL = ln(10)/µ
+    """
+    t_full = np.asarray(thickness_mm, dtype=float)
+    I_full = np.asarray(outputs, dtype=float)
+
+    mask = np.isfinite(t_full) & np.isfinite(I_full) & (I_full > 0.0)
+    t = t_full[mask]
+    I = I_full[mask]
+
+    if t.size < 2:
+        raise RuntimeError("Geçerli noktası (I>0) olan en az 2 dosya yok.")
+    if np.unique(t).size < 2:
+        raise RuntimeError("Tüm kalınlıklar aynı, HVL/TVL fit'i anlamsız.")
+
+    idx = np.argsort(t)
+    t = t[idx]
+    I = I[idx]
+
+    I0 = I[0]
+    if I0 <= 0:
+        positives = np.where(I > 0)[0]
+        if positives.size == 0:
+            raise RuntimeError("Pozitif I yok, HVL/TVL fit'i yapılamaz.")
+        I0 = I[positives[0]]
+
+    lnI_ratio = np.log(I / I0)
+    coeffs = np.polyfit(t, lnI_ratio, 1)
+    b = coeffs[0]
+    a = coeffs[1]
+
+    mu = -b
+    HVL = np.log(2.0) / mu
+    TVL = np.log(10.0) / mu
+
+    t_fit = np.linspace(float(np.min(t)), float(np.max(t)), 200)
+    lnI_fit = a + b * t_fit
+    I_fit = I0 * np.exp(lnI_fit)
+
+    fit_curve = np.vstack([t_fit, I_fit])
+    return mu, HVL, TVL, fit_curve, I0, mask
+
+
+def save_csv(filename: str, header: str, data: np.ndarray):
+    """Basit CSV kaydedici."""
+    np.savetxt(filename, data, delimiter=",", header=header, comments="")
+
+
+def parse_int_list(text: str) -> List[int]:
+    """'11,22,13' gibi bir metni [11,22,13] listesine çevir."""
+    text = text.strip()
+    if not text:
+        return []
+    parts = [p.strip() for p in text.replace(";", ",").split(",") if p.strip()]
+    out = []
+    for p in parts:
+        try:
+            out.append(int(p))
+        except ValueError:
+            continue
+    return out
+
+
+def autodetect_xyz_branches(branches: List[str]) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """X/Y/Z branch isimlerini tipik kalıplara göre otomatik tahmin et."""
+    lower_map = {b.lower(): b for b in branches}
+
+    candidates_x = ["posx", "x", "prex", "postx"]
+    candidates_y = ["posy", "y", "prey", "posty"]
+    candidates_z = ["posz", "z", "prez", "postz"]
+
+    def pick(cands):
+        for c in cands:
+            if c in lower_map:
+                return lower_map[c]
+        return None
+
+    return pick(candidates_x), pick(candidates_y), pick(candidates_z)
+
+
+# ---------- Matplotlib Canvas sınıfları ----------
+
+class PlotCanvas(FigureCanvas):
+    """2B grafikler için basit matplotlib canvas'ı."""
+
+    def __init__(self, parent=None):
+        fig = Figure(figsize=(5, 4), dpi=100)
+        super().__init__(fig)
+        self.setParent(parent)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.updateGeometry()
+
+    def plot_energy(self, centers, hist, title, xlabel, ylog: bool = False):
+        self.figure.clear()
+        ax = self.figure.add_subplot(111)
+        ax.step(centers, hist, where="mid")
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel("Counts")
+        ax.set_title(title)
+        if ylog and np.any(hist > 0):
+            ax.set_yscale("log")
+        else:
+            ax.set_yscale("linear")
+        ax.grid(True, linestyle="--", alpha=0.5)
+        self.figure.tight_layout()
+        self.draw()
+
+    def plot_depth_dose(self, z_centers, dose, title, xlabel):
+        self.figure.clear()
+        ax = self.figure.add_subplot(111)
+        if z_centers.size > 0:
+            ax.plot(z_centers, dose, marker="o")
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel("ΣEdep [a.u.]")
+        ax.set_title(title)
+        ax.grid(True, linestyle="--", alpha=0.5)
+        self.figure.tight_layout()
+        self.draw()
+
+    def plot_attenuation(self, t, I_norm, t_fit, I_fit_norm, mu, HVL, TVL, title):
+        self.figure.clear()
+        ax = self.figure.add_subplot(111)
+        ax.scatter(t, I_norm, label="Simülasyon Noktaları")
+        ax.plot(t_fit, I_fit_norm, linestyle="--", label="Fit")
+        ax.set_xlabel("Kalınlık [mm]")
+        ax.set_ylabel("I / I0")
+        ax.set_title(title)
+        ax.grid(True, linestyle="--", alpha=0.5)
+
+        text = (
+            f"µ = {mu:.4f} 1/mm\n"
+            f"HVL = {HVL:.3f} mm\n"
+            f"TVL = {TVL:.3f} mm"
+        )
+        ax.annotate(
+            text,
+            xy=(0.05, 0.95),
+            xycoords="axes fraction",
+            va="top",
+            ha="left",
+            bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
+        )
+        ax.legend()
+        self.figure.tight_layout()
+        self.draw()
+
+    def plot_2d_dose(self, H, xedges, zedges, title, xlabel="X", ylabel="Z"):
+        self.figure.clear()
+        ax = self.figure.add_subplot(111)
+
+        if H.size > 0:
+            extent = [xedges[0], xedges[-1], zedges[0], zedges[-1]]
+            im = ax.imshow(
+                H,
+                origin="lower",
+                extent=extent,
+                aspect="auto",
+            )
+            self.figure.colorbar(im, ax=ax, label="ΣEdep [a.u.]")
+
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        self.figure.tight_layout()
+        self.draw()
+
+
+class PlotCanvas3D(FigureCanvas):
+    """3B hit haritası için canvas."""
+
+    def __init__(self, parent=None):
+        fig = Figure(figsize=(5, 4), dpi=100)
+        super().__init__(fig)
+        self.setParent(parent)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.updateGeometry()
+
+    def plot_hits_3d(self, x, y, z, edep=None, title="", xlabel="X", ylabel="Y", zlabel="Z"):
+        self.figure.clear()
+        ax = self.figure.add_subplot(111, projection="3d")
+
+        if x is not None and y is not None and z is not None and x.size > 0:
+            if edep is not None and edep.size == x.size:
+                e = edep.astype(float)
+                finite = np.isfinite(e)
+                if np.any(finite):
+                    e_min = np.min(e[finite])
+                    e_max = np.max(e[finite])
+                    if e_max > e_min:
+                        e_norm = (e - e_min) / (e_max - e_min)
+                    else:
+                        e_norm = np.zeros_like(e)
+                else:
+                    e_norm = np.zeros_like(e)
+                sc = ax.scatter(x, y, z, s=5, c=e_norm, depthshade=True)
+                self.figure.colorbar(sc, ax=ax, label="Normalized Edep")
+            else:
+                ax.scatter(x, y, z, s=5, depthshade=True)
+        else:
+            ax.set_xlim(0, 1)
+            ax.set_ylim(0, 1)
+            ax.set_zlim(0, 1)
+
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.set_zlabel(zlabel)
+        ax.set_title(title or "3D Hit Haritası")
+        self.draw()
+
+
+class TrackCanvas3D(FigureCanvas):
+    """
+    Track viewer için 3B canvas.
+
+    Özellikler:
+    - Her track (eventID + trackID) bir polyline olarak çizilir.
+    - Primary track'ler kalın çizgi, secondary track'ler daha ince ve/veya noktalı.
+    - volumeID'lerden otomatik bounding-box çıkarılıp yarı-şeffaf kutu olarak çizilebilir.
+    """
+
+    def __init__(self, parent=None):
+        fig = Figure(figsize=(5, 4), dpi=100)
+        super().__init__(fig)
+        self.setParent(parent)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.updateGeometry()
+
+    def _draw_geometry_boxes(self, ax, volume_bounds: Dict[int, Tuple[float, float, float, float, float, float]]):
+        """
+        volumeID -> (xmin, xmax, ymin, ymax, zmin, zmax) sözlüğüne göre 3D kutular çizer.
+        """
+        for vid, (xmin, xmax, ymin, ymax, zmin, zmax) in volume_bounds.items():
+            # Kutunun köşeleri
+            corners = [
+                (xmin, ymin, zmin),
+                (xmax, ymin, zmin),
+                (xmax, ymax, zmin),
+                (xmin, ymax, zmin),
+                (xmin, ymin, zmax),
+                (xmax, ymin, zmax),
+                (xmax, ymax, zmax),
+                (xmin, ymax, zmax),
+            ]
+            faces = [
+                [corners[i] for i in [0, 1, 2, 3]],
+                [corners[i] for i in [4, 5, 6, 7]],
+                [corners[i] for i in [0, 1, 5, 4]],
+                [corners[i] for i in [1, 2, 6, 5]],
+                [corners[i] for i in [2, 3, 7, 6]],
+                [corners[i] for i in [3, 0, 4, 7]],
+            ]
+            poly = Poly3DCollection(faces, alpha=0.15)
+            ax.add_collection3d(poly)
+            # Kutunun merkezine volumeID yaz
+            cx = 0.5 * (xmin + xmax)
+            cy = 0.5 * (ymin + ymax)
+            cz = 0.5 * (zmin + zmax)
+            ax.text(cx, cy, cz, f"V{vid}", fontsize=8, ha="center", va="center")
+
+    def plot_tracks(self,
+                    x: np.ndarray,
+                    y: np.ndarray,
+                    z: np.ndarray,
+                    event_id: np.ndarray,
+                    track_id: np.ndarray,
+                    parent_id: Optional[np.ndarray],
+                    volume_id: Optional[np.ndarray],
+                    pdg_id: Optional[np.ndarray],
+                    selected_event: int,
+                    max_tracks_to_draw: int = 50,
+                    only_primary: bool = False,
+                    only_secondary: bool = False,
+                    pdg_filter: Optional[List[int]] = None,
+                    title: str = "Track Viewer"):
+        """
+        Seçilen eventID için track'leri 3D olarak çizer.
+
+        Parametreler
+        -----------
+        x,y,z : float array
+        event_id, track_id, parent_id, volume_id, pdg_id : array
+        selected_event : int
+            Hangi eventID'nin çizileceği.
+        max_tracks_to_draw : int
+            En fazla kaç farklı track çizileceği (çok kalabalık sahneleri sınırlamak için).
+        only_primary, only_secondary : bool
+            Primary/secondary filtreleri (parentID'ye göre).
+        pdg_filter : Optional[List[int]]
+            Sadece belirli PDG ID'leri çizmek için.
+        """
+        self.figure.clear()
+        ax = self.figure.add_subplot(111, projection="3d")
+
+        if x is None or y is None or z is None:
+            ax.set_title("Track verisi yok (eventID/trackID/posX/Y/Z bulunamadı).")
+            self.draw()
+            return
+
+        x = np.asarray(x, dtype=float)
+        y = np.asarray(y, dtype=float)
+        z = np.asarray(z, dtype=float)
+        event_id = np.asarray(event_id, dtype=int)
+        track_id = np.asarray(track_id, dtype=int)
+
+        if parent_id is not None:
+            parent_id = np.asarray(parent_id, dtype=int)
+        if volume_id is not None:
+            volume_id = np.asarray(volume_id, dtype=int)
+        if pdg_id is not None:
+            pdg_id = np.asarray(pdg_id, dtype=int)
+
+        # Seçilen event için maske
+        mask_ev = (event_id == selected_event)
+        if not np.any(mask_ev):
+            ax.set_title(f"EventID={selected_event} için adım bulunamadı.")
+            self.draw()
+            return
+
+        x_ev = x[mask_ev]
+        y_ev = y[mask_ev]
+        z_ev = z[mask_ev]
+        tid_ev = track_id[mask_ev]
+        pid_ev = pdg_id[mask_ev] if pdg_id is not None else None
+        par_ev = parent_id[mask_ev] if parent_id is not None else None
+        vol_ev = volume_id[mask_ev] if volume_id is not None else None
+
+        # PDG filtresi
+        if pdg_filter and (pid_ev is not None):
+            mask_pdg = np.isin(pid_ev, np.array(pdg_filter, dtype=int))
+            x_ev, y_ev, z_ev = x_ev[mask_pdg], y_ev[mask_pdg], z_ev[mask_pdg]
+            tid_ev = tid_ev[mask_pdg]
+            if par_ev is not None:
+                par_ev = par_ev[mask_pdg]
+            if vol_ev is not None:
+                vol_ev = vol_ev[mask_pdg]
+            if pid_ev is not None:
+                pid_ev = pid_ev[mask_pdg]
+
+        # Primary / secondary filtresi
+        if par_ev is not None:
+            if only_primary and not only_secondary:
+                mask_prim = (par_ev == 0)
+                x_ev, y_ev, z_ev = x_ev[mask_prim], y_ev[mask_prim], z_ev[mask_prim]
+                tid_ev = tid_ev[mask_prim]
+                par_ev = par_ev[mask_prim]
+                if vol_ev is not None:
+                    vol_ev = vol_ev[mask_prim]
+                if pid_ev is not None:
+                    pid_ev = pid_ev[mask_prim]
+            elif only_secondary and not only_primary:
+                mask_sec = (par_ev != 0)
+                x_ev, y_ev, z_ev = x_ev[mask_sec], y_ev[mask_sec], z_ev[mask_sec]
+                tid_ev = tid_ev[mask_sec]
+                par_ev = par_ev[mask_sec]
+                if vol_ev is not None:
+                    vol_ev = vol_ev[mask_sec]
+                if pid_ev is not None:
+                    pid_ev = pid_ev[mask_sec]
+
+        if x_ev.size == 0:
+            ax.set_title(f"EventID={selected_event} için filtreden geçen step yok.")
+            self.draw()
+            return
+
+        unique_tracks = np.unique(tid_ev)
+        if unique_tracks.size > max_tracks_to_draw:
+            unique_tracks = unique_tracks[:max_tracks_to_draw]
+
+        # Volume bounding-box (geometri overlay)
+        if vol_ev is not None:
+            volume_bounds: Dict[int, Tuple[float, float, float, float, float, float]] = {}
+            for vid in np.unique(vol_ev):
+                mask_v = (vol_ev == vid)
+                xv = x_ev[mask_v]
+                yv = y_ev[mask_v]
+                zv = z_ev[mask_v]
+                if xv.size == 0:
+                    continue
+                xmin, xmax = float(np.min(xv)), float(np.max(xv))
+                ymin, ymax = float(np.min(yv)), float(np.max(yv))
+                zmin, zmax = float(np.min(zv)), float(np.max(zv))
+                # Çok ince bounding box'ları biraz şişir
+                if np.isclose(xmin, xmax):
+                    delta = 0.5
+                    xmin -= delta
+                    xmax += delta
+                if np.isclose(ymin, ymax):
+                    delta = 0.5
+                    ymin -= delta
+                    ymax += delta
+                if np.isclose(zmin, zmax):
+                    delta = 0.5
+                    zmin -= delta
+                    zmax += delta
+                volume_bounds[int(vid)] = (xmin, xmax, ymin, ymax, zmin, zmax)
+
+            self._draw_geometry_boxes(ax, volume_bounds)
+
+        # Track çizimi
+        for tid in unique_tracks:
+            m_t = (tid_ev == tid)
+            x_t = x_ev[m_t]
+            y_t = y_ev[m_t]
+            z_t = z_ev[m_t]
+
+            if x_t.size < 2:
+                continue
+
+            # Step sırasına göre sort edelim (yaklaşık bir sıra, stepIndex'i kullanmak istersek GUI'de ayrıca verilebilir)
+            # Burada sadece Z'ye göre sıralıyoruz (boşlukta monotonic olacağı varsayımı).
+            order = np.argsort(z_t)
+            x_t = x_t[order]
+            y_t = y_t[order]
+            z_t = z_t[order]
+
+            if par_ev is not None:
+                par_for_track = par_ev[m_t][0]
+                if par_for_track == 0:
+                    lw = 2.0
+                    ls = "-"
+                else:
+                    lw = 1.0
+                    ls = "--"
+            else:
+                lw = 1.5
+                ls = "-"
+
+            ax.plot(x_t, y_t, z_t, linewidth=lw, linestyle=ls)
+
+        ax.set_xlabel("X [mm]")
+        ax.set_ylabel("Y [mm]")
+        ax.set_zlabel("Z [mm]")
+        ax.set_title(f"{title} (EventID={selected_event}, Tracks={unique_tracks.size})")
+        self.draw()
+
+
+# ---------- Ana Pencere ----------
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Geant4 Shielding Analyzer GUI (Tracks + Geometry Overlay)")
+        self.resize(1800, 950)
+
+        self.total_outputs: List[float] = []
+        self.thickness_list: List[float] = []
+        self.file_names: List[str] = []
+
+        self.particle_dose_summary: Dict[int, float] = {}
+        self.volume_dose_summary: Dict[int, Tuple[float, int]] = {}
+
+        # Track viewer için son dosyadan gelen full arrays
+        self.track_last_x = None
+        self.track_last_y = None
+        self.track_last_z = None
+        self.track_last_event = None
+        self.track_last_track = None
+        self.track_last_parent = None
+        self.track_last_volume = None
+        self.track_last_pdg = None
+
+        central = QWidget()
+        self.setCentralWidget(central)
+
+        main_layout = QHBoxLayout(central)
+
+        # Sol panel
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+
+        self.file_list = QListWidget()
+        self.file_list.currentItemChanged.connect(self.on_file_selection_changed)
+
+        btn_add = QPushButton("ROOT Dosyası Ekle")
+        btn_add.clicked.connect(self.add_files)
+
+        btn_remove = QPushButton("Seçileni Sil")
+        btn_remove.clicked.connect(self.remove_selected)
+
+        btn_clear = QPushButton("Listeyi Temizle")
+        btn_clear.clicked.connect(self.clear_list)
+
+        thickness_label = QLabel("Seçili dosya için kalınlık [mm]:")
+        self.thickness_spin = QDoubleSpinBox()
+        self.thickness_spin.setRange(0.0, 1e6)
+        self.thickness_spin.setDecimals(3)
+        self.thickness_spin.setSingleStep(1.0)
+        self.thickness_spin.valueChanged.connect(self.on_thickness_changed)
+
+        self.btn_list_ttrees = QPushButton("Seçili dosyadaki TTree'leri listele")
+        self.btn_list_ttrees.clicked.connect(self.list_ttrees)
+
+        self.btn_show_fileinfo = QPushButton("Seçili dosya içeriğini göster")
+        self.btn_show_fileinfo.clicked.connect(self.show_file_info)
+
+        left_layout.addWidget(self.file_list)
+        left_layout.addWidget(btn_add)
+
+        row_btns = QHBoxLayout()
+        row_btns.addWidget(btn_remove)
+        row_btns.addWidget(btn_clear)
+        left_layout.addLayout(row_btns)
+
+        left_layout.addWidget(self.btn_list_ttrees)
+        left_layout.addWidget(self.btn_show_fileinfo)
+        left_layout.addWidget(thickness_label)
+        left_layout.addWidget(self.thickness_spin)
+
+        # Orta panel
+        middle_widget = QWidget()
+        middle_layout = QVBoxLayout(middle_widget)
+
+        form = QFormLayout()
+        self.tree_edit = QLineEdit("Hits")
+        self.edep_edit = QLineEdit("Edep")
+        self.x_edit = QLineEdit("")
+        self.y_edit = QLineEdit("")
+        self.z_edit = QLineEdit("")
+        self.pid_branch_edit = QLineEdit("particleID")
+        self.volume_branch_edit = QLineEdit("volumeID")
+        self.event_branch_edit = QLineEdit("eventID")
+        self.track_branch_edit = QLineEdit("trackID")
+        self.parent_branch_edit = QLineEdit("parentID")
+
+        self.nbins_edep_spin = QSpinBox()
+        self.nbins_edep_spin.setRange(10, 10000)
+        self.nbins_edep_spin.setValue(200)
+
+        self.nbins_depth_spin = QSpinBox()
+        self.nbins_depth_spin.setRange(10, 10000)
+        self.nbins_depth_spin.setValue(100)
+
+        self.nx_2d_spin = QSpinBox()
+        self.nx_2d_spin.setRange(10, 400)
+        self.nx_2d_spin.setValue(80)
+        self.nz_2d_spin = QSpinBox()
+        self.nz_2d_spin.setRange(10, 400)
+        self.nz_2d_spin.setValue(80)
+
+        form.addRow("TTree adı:", self.tree_edit)
+        form.addRow("Edep branch adı:", self.edep_edit)
+        form.addRow("X branch adı (opsiyonel):", self.x_edit)
+        form.addRow("Y branch adı (opsiyonel):", self.y_edit)
+        form.addRow("Z branch adı (opsiyonel):", self.z_edit)
+        form.addRow("particleID branch adı:", self.pid_branch_edit)
+        form.addRow("volumeID branch adı:", self.volume_branch_edit)
+        form.addRow("eventID branch adı:", self.event_branch_edit)
+        form.addRow("trackID branch adı:", self.track_branch_edit)
+        form.addRow("parentID branch adı:", self.parent_branch_edit)
+        form.addRow("Edep bin sayısı:", self.nbins_edep_spin)
+        form.addRow("Derinlik-doz bin sayısı:", self.nbins_depth_spin)
+        form.addRow("2D doz haritası X bin sayısı:", self.nx_2d_spin)
+        form.addRow("2D doz haritası Z bin sayısı:", self.nz_2d_spin)
+
+        # Çıkış yüzeyi Z aralığı
+        self.use_zrange_cb = QCheckBox("I hesabı için çıkış yüzeyi Z aralığı kullan")
+        self.zmin_out_spin = QDoubleSpinBox()
+        self.zmin_out_spin.setRange(-1e6, 1e6)
+        self.zmin_out_spin.setDecimals(3)
+        self.zmin_out_spin.setSingleStep(0.1)
+        self.zmax_out_spin = QDoubleSpinBox()
+        self.zmax_out_spin.setRange(-1e6, 1e6)
+        self.zmax_out_spin.setDecimals(3)
+        self.zmax_out_spin.setSingleStep(0.1)
+
+        form.addRow(self.use_zrange_cb)
+        form.addRow("Z_min (çıkış yüzeyi):", self.zmin_out_spin)
+        form.addRow("Z_max (çıkış yüzeyi):", self.zmax_out_spin)
+
+        # Parçacık filtresi
+        self.use_pid_filter_cb = QCheckBox("Sadece seçilen PDG ID'leri analiz et")
+        self.pid_list_edit = QLineEdit("")
+        form.addRow(self.use_pid_filter_cb)
+        form.addRow("PDG ID listesi (virgülle):", self.pid_list_edit)
+
+        # Volume filtresi
+        self.use_volume_filter_cb = QCheckBox("Sadece seçilen volumeID'leri analiz et")
+        self.volume_list_edit = QLineEdit("")
+        form.addRow(self.use_volume_filter_cb)
+        form.addRow("Volume ID listesi (virgülle):", self.volume_list_edit)
+
+        # Track viewer filtreleri
+        self.track_event_spin = QSpinBox()
+        self.track_event_spin.setRange(0, 1_000_000)
+        self.track_event_spin.setValue(0)
+
+        self.track_only_primary_cb = QCheckBox("Yalnız primary track'ler")
+        self.track_only_secondary_cb = QCheckBox("Yalnız secondary track'ler")
+
+        self.track_max_spin = QSpinBox()
+        self.track_max_spin.setRange(1, 1000)
+        self.track_max_spin.setValue(50)
+
+        self.track_pdg_filter_edit = QLineEdit("")
+
+        form.addRow(QLabel("--- Track Viewer Ayarları ---"))
+        form.addRow("Görüntülenecek EventID:", self.track_event_spin)
+        form.addRow("Max track sayısı:", self.track_max_spin)
+        form.addRow("Track PDG filtresi (virgülle):", self.track_pdg_filter_edit)
+        form.addRow(self.track_only_primary_cb)
+        form.addRow(self.track_only_secondary_cb)
+
+        self.btn_list_branches = QPushButton("Seçili dosyada branch'leri listele")
+        self.btn_list_branches.clicked.connect(self.list_branches)
+
+        self.run_button = QPushButton("Analizi Çalıştır")
+        self.run_button.clicked.connect(self.run_analysis)
+
+        self.update_tracks_button = QPushButton("Track Viewer'ı EventID'ye göre güncelle")
+        self.update_tracks_button.clicked.connect(self.update_track_viewer_from_ui)
+
+        self.save_log_button = QPushButton("Log'u kaydet")
+        self.save_log_button.clicked.connect(self.save_log_to_file)
+
+        self.log_edit = QTextEdit()
+        self.log_edit.setReadOnly(True)
+
+        middle_layout.addLayout(form)
+        middle_layout.addWidget(self.btn_list_branches)
+        middle_layout.addWidget(self.run_button)
+        middle_layout.addWidget(self.update_tracks_button)
+        middle_layout.addWidget(self.save_log_button)
+        middle_layout.addWidget(QLabel("Log:"))
+        middle_layout.addWidget(self.log_edit)
+
+        # Sağ panel: grafikler + özet
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+
+        self.tabs = QTabWidget()
+        # Enerji
+        self.energy_canvas = PlotCanvas()
+        energy_widget = QWidget()
+        ev_layout = QVBoxLayout(energy_widget)
+        ev_layout.addWidget(self.energy_canvas)
+        self.tabs.addTab(energy_widget, "Enerji Spektrumu")
+        # Derinlik-doz
+        self.depth_canvas = PlotCanvas()
+        depth_widget = QWidget()
+        dd_layout = QVBoxLayout(depth_widget)
+        dd_layout.addWidget(self.depth_canvas)
+        self.tabs.addTab(depth_widget, "Derinlik-Doz")
+        # Zayıflama
+        self.atten_canvas = PlotCanvas()
+        atten_widget = QWidget()
+        at_layout = QVBoxLayout(atten_widget)
+        at_layout.addWidget(self.atten_canvas)
+        self.tabs.addTab(atten_widget, "Zayıflama (HVL/TVL)")
+        # 3D hits
+        self.hit3d_canvas = PlotCanvas3D()
+        hit3d_widget = QWidget()
+        h3_layout = QVBoxLayout(hit3d_widget)
+        h3_layout.addWidget(self.hit3d_canvas)
+        self.tabs.addTab(hit3d_widget, "3D Hit Haritası")
+        # 2D doz
+        self.dose2d_canvas = PlotCanvas()
+        dose2d_widget = QWidget()
+        d2_layout = QVBoxLayout(dose2d_widget)
+        d2_layout.addWidget(self.dose2d_canvas)
+        self.tabs.addTab(dose2d_widget, "2D Doz Haritası (X-Z)")
+        # Özet
+        self.summary_table = QTableWidget(0, 4)
+        self.summary_table.setHorizontalHeaderLabels(["Dosya", "Kalınlık [mm]", "ΣEdep", "I/I0"])
+        summary_widget = QWidget()
+        s_layout = QVBoxLayout(summary_widget)
+        s_layout.addWidget(self.summary_table)
+        self.tabs.addTab(summary_widget, "Özet")
+        # Parçacık özeti
+        self.particle_table = QTableWidget(0, 3)
+        self.particle_table.setHorizontalHeaderLabels(["PDG ID", "ΣEdep", "Toplam İçindeki Payı"])
+        particle_widget = QWidget()
+        p_layout = QVBoxLayout(particle_widget)
+        p_layout.addWidget(self.particle_table)
+        self.tabs.addTab(particle_widget, "Parçacık Özeti")
+        # Volume özeti
+        self.volume_table = QTableWidget(0, 4)
+        self.volume_table.setHorizontalHeaderLabels(
+            ["Volume ID", "ΣEdep", "Hit Sayısı", "Toplam ΣEdep İçindeki Payı"]
+        )
+        volume_widget = QWidget()
+        v_layout = QVBoxLayout(volume_widget)
+        v_layout.addWidget(self.volume_table)
+        self.tabs.addTab(volume_widget, "Volume Özeti")
+        # Track viewer
+        self.track_canvas = TrackCanvas3D()
+        track_widget = QWidget()
+        tv_layout = QVBoxLayout(track_widget)
+        tv_layout.addWidget(self.track_canvas)
+        self.tabs.addTab(track_widget, "Track Viewer")
+
+        self.energy_log_cb = QCheckBox("Enerji spektrumu için log Y ekseni")
+        self.energy_log_cb.stateChanged.connect(self.redraw_last_energy)
+
+        right_layout.addWidget(self.energy_log_cb)
+        right_layout.addWidget(self.tabs)
+
+        main_layout.addWidget(left_widget, 2)
+        main_layout.addWidget(middle_widget, 3)
+        main_layout.addWidget(right_widget, 7)
+
+        # Enerji grafiği için cache
+        self._last_energy_centers = None
+        self._last_energy_hist = None
+        self._last_energy_xlabel = ""
+        self._last_energy_title = ""
+
+    # ---------- Yardımcılar ----------
+
+    def log(self, msg: str):
+        self.log_edit.append(msg)
+        self.log_edit.moveCursor(self.log_edit.textCursor().End)
+        QApplication.processEvents()
+
+    def current_item(self):
+        return self.file_list.currentItem()
+
+    def save_log_to_file(self):
+        text = self.log_edit.toPlainText()
+        if not text.strip():
+            QMessageBox.information(self, "Bilgi", "Log boş, kaydedilecek içerik yok.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Log'u kaydet",
+            "shielding_log.txt",
+            "Text files (*.txt);;All files (*)",
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+            QMessageBox.information(self, "Bilgi", f"Log kaydedildi:\n{path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Hata", f"Log kaydedilemedi:\n{e}")
+
+    # ---------- Dosya listesi ----------
+
+    def add_files(self):
+        files, _ = QFileDialog.getOpenFileNames(
+            self,
+            "ROOT Dosyası Seç",
+            "",
+            "ROOT files (*.root);;All files (*)",
+        )
+        if not files:
+            return
+        for f in files:
+            basename = os.path.basename(f)
+            inferred_thickness = infer_thickness_from_filename(basename)
+            item = QListWidgetItem(basename)
+            item.setData(Qt.UserRole, {"path": f, "thickness_mm": inferred_thickness or 0.0})
+            self.file_list.addItem(item)
+            if inferred_thickness is not None:
+                self.log(f"{basename} için dosya adından kalınlık tahmin edildi: {inferred_thickness} mm")
+        self.log(f"{len(files)} dosya eklendi.")
+
+    def remove_selected(self):
+        item = self.current_item()
+        if item is None:
+            return
+        row = self.file_list.row(item)
+        self.file_list.takeItem(row)
+        self.log("Seçili dosya listeden silindi.")
+
+    def clear_list(self):
+        self.file_list.clear()
+        self.log("Dosya listesi temizlendi.")
+
+    def on_file_selection_changed(self, current, previous):
+        if current is None:
+            self.thickness_spin.blockSignals(True)
+            self.thickness_spin.setValue(0.0)
+            self.thickness_spin.blockSignals(False)
+            return
+        data = current.data(Qt.UserRole) or {}
+        thickness = data.get("thickness_mm", 0.0) or 0.0
+        self.thickness_spin.blockSignals(True)
+        self.thickness_spin.setValue(thickness)
+        self.thickness_spin.blockSignals(False)
+
+    def on_thickness_changed(self, value: float):
+        item = self.current_item()
+        if item is None:
+            return
+        data = item.data(Qt.UserRole) or {}
+        data["thickness_mm"] = float(value)
+        item.setData(Qt.UserRole, data)
+
+    # ---------- TTree / branch / dosya içeriği ----------
+
+    def list_ttrees(self):
+        item = self.current_item()
+        if item is None:
+            QMessageBox.warning(self, "Uyarı", "Önce sol listeden bir dosya seç.")
+            return
+        data = item.data(Qt.UserRole) or {}
+        path = data.get("path")
+        try:
+            names = list_ttrees_in_file(path)
+        except Exception as e:
+            self.log(f"[HATA] TTree listelenemedi: {e}")
+            QMessageBox.critical(self, "Hata", str(e))
+            return
+
+        if not names:
+            text = "Bu dosyada TTree bulunamadı."
+        else:
+            text = "Bu dosyadaki TTree'ler:\n" + "\n".join(f"  - {n}" for n in names)
+        self.log(text)
+        QMessageBox.information(self, "TTrees", text)
+
+    def list_branches(self):
+        item = self.current_item()
+        if item is None:
+            QMessageBox.warning(self, "Uyarı", "Önce sol listeden bir dosya seç.")
+            return
+        tree_name = self.tree_edit.text().strip()
+        if not tree_name:
+            QMessageBox.warning(self, "Uyarı", "Önce TTree adını gir.")
+            return
+        data = item.data(Qt.UserRole) or {}
+        path = data.get("path")
+        try:
+            branches = list_branches_in_tree(path, tree_name)
+        except Exception as e:
+            self.log(f"[HATA] Branch listelenemedi: {e}")
+            QMessageBox.critical(self, "Hata", str(e))
+            return
+
+        if not branches:
+            text = f"'{tree_name}' içinde branch bulunamadı."
+        else:
+            text = f"'{tree_name}' içindeki branch'ler:\n" + "\n".join(f"  - {b}" for b in branches)
+
+        self.log(text)
+        QMessageBox.information(self, "Branch'ler", text)
+
+    def show_file_info(self):
+        item = self.current_item()
+        if item is None:
+            QMessageBox.warning(self, "Uyarı", "Önce sol listeden bir dosya seç.")
+            return
+        data = item.data(Qt.UserRole) or {}
+        path = data.get("path")
+
+        try:
+            f = uproot.open(path)
+        except Exception as e:
+            self.log(f"[HATA] Dosya açılamadı: {e}")
+            QMessageBox.critical(self, "Hata", str(e))
+            return
+
+        lines = [f"Dosya: {path}", "İçerik:"]
+        for key, obj in f.items():
+            name = key.split(";")[0]
+            tname = type(obj).__name__
+            extra = ""
+            if isinstance(obj, uproot.behaviors.TTree.TTree):
+                extra = f" (TTree, entries={obj.num_entries})"
+            lines.append(f"  - {name}: {tname}{extra}")
+
+        text = "\n".join(lines)
+        self.log(text)
+        QMessageBox.information(self, "Dosya İçeriği", text)
+
+    # ---------- Analiz ----------
+
+    def run_analysis(self):
+        n_items = self.file_list.count()
+        if n_items == 0:
+            QMessageBox.warning(self, "Uyarı", "Önce en az bir ROOT dosyası eklemelisin.")
+            return
+
+        tree_name = self.tree_edit.text().strip()
+        edep_branch = self.edep_edit.text().strip()
+        x_branch_user = self.x_edit.text().strip() or None
+        y_branch_user = self.y_edit.text().strip() or None
+        z_branch_user = self.z_edit.text().strip() or None
+        pid_branch = self.pid_branch_edit.text().strip() or None
+        volume_branch = self.volume_branch_edit.text().strip() or None
+        event_branch = self.event_branch_edit.text().strip() or None
+        track_branch = self.track_branch_edit.text().strip() or None
+        parent_branch = self.parent_branch_edit.text().strip() or None
+
+        nbins_edep = self.nbins_edep_spin.value()
+        nbins_depth = self.nbins_depth_spin.value()
+        nx_2d = self.nx_2d_spin.value()
+        nz_2d = self.nz_2d_spin.value()
+
+        if not tree_name:
+            QMessageBox.warning(self, "Uyarı", "TTree adı boş olamaz.")
+            return
+        if not edep_branch:
+            QMessageBox.warning(self, "Uyarı", "Edep branch adı boş olamaz.")
+            return
+
+        use_zwindow = self.use_zrange_cb.isChecked()
+        zmin_out = self.zmin_out_spin.value()
+        zmax_out = self.zmax_out_spin.value()
+
+        use_pid_filter = self.use_pid_filter_cb.isChecked()
+        pdg_list = parse_int_list(self.pid_list_edit.text())
+        if use_pid_filter and (pid_branch is None or not pdg_list):
+            self.log("[UYARI] Parçacık filtresi aktif ama particleID branch veya PDG listesi tanımlı değil. Filtre uygulanmayacak.")
+            use_pid_filter = False
+
+        use_volume_filter = self.use_volume_filter_cb.isChecked()
+        volume_list = parse_int_list(self.volume_list_edit.text())
+        if use_volume_filter and (volume_branch is None or not volume_list):
+            self.log("[UYARI] Volume filtresi aktif ama volumeID branch veya volume listesi tanımlı değil. Filtre uygulanmayacak.")
+            use_volume_filter = False
+
+        self.log("=== Analiz başlıyor ===")
+        self.log(
+            f"TTree: {tree_name}, Edep: {edep_branch}, "
+            f"X: {x_branch_user}, Y: {y_branch_user}, Z: {z_branch_user}, "
+            f"PID: {pid_branch}, Volume: {volume_branch}, "
+            f"eventID: {event_branch}, trackID: {track_branch}, parentID: {parent_branch}"
+        )
+
+        if use_zwindow and z_branch_user is not None and zmax_out > zmin_out:
+            self.log(f"I hesabı için Z aralığı kullanılacak: [{zmin_out},{zmax_out}]")
+        else:
+            if use_zwindow and z_branch_user is None:
+                self.log("[UYARI] Z branch tanımlı değil, Z aralığı kullanılamaz. Tüm hacim kullanılacak.")
+            elif use_zwindow and not (zmax_out > zmin_out):
+                self.log("[UYARI] Z_min < Z_max değil, Z aralığı geçersiz. Tüm hacim kullanılacak.")
+            self.log("I hesabı tüm Edep üzerinden yapılacak (Z bağımsız).")
+
+        if use_pid_filter:
+            self.log(f"Parçacık filtresi aktif. PDG ID'ler: {pdg_list}")
+        if use_volume_filter:
+            self.log(f"Volume filtresi aktif. Volume ID'ler: {volume_list}")
+
+        self.total_outputs = []
+        self.thickness_list = []
+        self.file_names = []
+        self.particle_dose_summary = {}
+        self.volume_dose_summary = {}
+        self.summary_table.setRowCount(0)
+        self.particle_table.setRowCount(0)
+        self.volume_table.setRowCount(0)
+
+        # Track viewer cache sıfırla
+        self.track_last_x = None
+        self.track_last_y = None
+        self.track_last_z = None
+        self.track_last_event = None
+        self.track_last_track = None
+        self.track_last_parent = None
+        self.track_last_volume = None
+        self.track_last_pdg = None
+
+        out_dir = os.getcwd()
+
+        last_centers = None
+        last_hist = None
+        last_z_centers = None
+        last_dose = None
+        last_x = None
+        last_y = None
+        last_z = None
+        last_edep_for_3d = None
+        last_H2d = None
+        last_xedges = None
+        last_zedges = None
+
+        for idx in range(n_items):
+            item = self.file_list.item(idx)
+            data = item.data(Qt.UserRole) or {}
+            path = data.get("path")
+            thickness_mm = float(data.get("thickness_mm", 0.0) or 0.0)
+            base = os.path.splitext(os.path.basename(path))[0]
+
+            if thickness_mm == 0.0:
+                inferred = infer_thickness_from_filename(base)
+                if inferred is not None:
+                    thickness_mm = inferred
+                    data["thickness_mm"] = inferred
+                    item.setData(Qt.UserRole, data)
+                    self.log(f"{base} için kalınlık isimden otomatik alındı: {inferred} mm")
+
+            self.log(f"[{idx+1}/{n_items}] Dosya işleniyor: {path}")
+
+            try:
+                tree = read_tree(path, tree_name)
+            except Exception as e:
+                self.log(f"[HATA] TTree okunamadı: {e}")
+                QMessageBox.critical(self, "Hata", str(e))
+                continue
+
+            try:
+                all_branches = list(tree.keys())
+            except Exception:
+                all_branches = []
+
+            # Edep
+            try:
+                edep_raw = get_branch(tree, edep_branch)
+            except Exception as e:
+                self.log(f"[HATA] {e}")
+                QMessageBox.critical(self, "Hata", str(e))
+                continue
+
+            # XYZ auto-detect
+            x_branch = x_branch_user
+            y_branch = y_branch_user
+            z_branch = z_branch_user
+            if x_branch is None or y_branch is None or z_branch is None:
+                if all_branches:
+                    ax, ay, az = autodetect_xyz_branches(all_branches)
+                    if x_branch is None and ax is not None:
+                        x_branch = ax
+                        self.log(f"  -> X branch auto-detect: {x_branch}")
+                    if y_branch is None and ay is not None:
+                        y_branch = ay
+                        self.log(f"  -> Y branch auto-detect: {y_branch}")
+                    if z_branch is None and az is not None:
+                        z_branch = az
+                        self.log(f"  -> Z branch auto-detect: {z_branch}")
+
+            # X,Y,Z, PID, Volume, Event, Track, Parent
+            x_arr_raw = None
+            y_arr_raw = None
+            z_arr_raw = None
+            if x_branch is not None:
+                try:
+                    x_arr_raw = get_branch(tree, x_branch)
+                except Exception as e:
+                    self.log(f"[UYARI] X branch okunamadı ({x_branch}): {e}")
+            if y_branch is not None:
+                try:
+                    y_arr_raw = get_branch(tree, y_branch)
+                except Exception as e:
+                    self.log(f"[UYARI] Y branch okunamadı ({y_branch}): {e}")
+            if z_branch is not None:
+                try:
+                    z_arr_raw = get_branch(tree, z_branch)
+                except Exception as e:
+                    self.log(f"[UYARI] Z branch okunamadı ({z_branch}): {e}")
+
+            pid_arr = None
+            if pid_branch is not None:
+                try:
+                    pid_arr = get_branch(tree, pid_branch)
+                except Exception as e:
+                    self.log(f"[UYARI] particleID branch okunamadı ({pid_branch}): {e}")
+                    pid_arr = None
+
+            volume_arr = None
+            if volume_branch is not None:
+                try:
+                    volume_arr = get_branch(tree, volume_branch)
+                except Exception as e:
+                    self.log(f"[UYARI] volumeID branch okunamadı ({volume_branch}): {e}")
+                    volume_arr = None
+
+            event_arr = None
+            if event_branch is not None:
+                try:
+                    event_arr = get_branch(tree, event_branch)
+                except Exception as e:
+                    self.log(f"[UYARI] eventID branch okunamadı ({event_branch}): {e}")
+                    event_arr = None
+
+            track_arr = None
+            if track_branch is not None:
+                try:
+                    track_arr = get_branch(tree, track_branch)
+                except Exception as e:
+                    self.log(f"[UYARI] trackID branch okunamadı ({track_branch}): {e}")
+                    track_arr = None
+
+            parent_arr = None
+            if parent_branch is not None:
+                try:
+                    parent_arr = get_branch(tree, parent_branch)
+                except Exception as e:
+                    self.log(f"[UYARI] parentID branch okunamadı ({parent_branch}): {e}")
+                    parent_arr = None
+
+            edep = np.asarray(edep_raw, dtype=float)
+            x_arr = np.asarray(x_arr_raw, dtype=float) if x_arr_raw is not None else None
+            y_arr = np.asarray(y_arr_raw, dtype=float) if y_arr_raw is not None else None
+            z_arr = np.asarray(z_arr_raw, dtype=float) if z_arr_raw is not None else None
+
+            if pid_arr is not None:
+                pid_arr = np.asarray(pid_arr, dtype=int)
+            if volume_arr is not None:
+                volume_arr = np.asarray(volume_arr, dtype=int)
+            if event_arr is not None:
+                event_arr = np.asarray(event_arr, dtype=int)
+            if track_arr is not None:
+                track_arr = np.asarray(track_arr, dtype=int)
+            if parent_arr is not None:
+                parent_arr = np.asarray(parent_arr, dtype=int)
+
+            # PDG filtresi
+            if use_pid_filter and (pid_arr is not None):
+                mask = np.isin(pid_arr, np.array(pdg_list, dtype=int))
+                if x_arr is not None:
+                    x_arr = x_arr[mask]
+                if y_arr is not None:
+                    y_arr = y_arr[mask]
+                if z_arr is not None:
+                    z_arr = z_arr[mask]
+                if volume_arr is not None:
+                    volume_arr = volume_arr[mask]
+                if event_arr is not None:
+                    event_arr = event_arr[mask]
+                if track_arr is not None:
+                    track_arr = track_arr[mask]
+                if parent_arr is not None:
+                    parent_arr = parent_arr[mask]
+                edep = edep[mask]
+                pid_arr = pid_arr[mask]
+                self.log(f"  -> Parçacık filtresi sonrası event sayısı: {np.count_nonzero(mask)}")
+
+            # Volume filtresi
+            if use_volume_filter and (volume_arr is not None):
+                mask_v = np.isin(volume_arr, np.array(volume_list, dtype=int))
+                if x_arr is not None:
+                    x_arr = x_arr[mask_v]
+                if y_arr is not None:
+                    y_arr = y_arr[mask_v]
+                if z_arr is not None:
+                    z_arr = z_arr[mask_v]
+                if pid_arr is not None:
+                    pid_arr = pid_arr[mask_v]
+                if event_arr is not None:
+                    event_arr = event_arr[mask_v]
+                if track_arr is not None:
+                    track_arr = track_arr[mask_v]
+                if parent_arr is not None:
+                    parent_arr = parent_arr[mask_v]
+                edep = edep[mask_v]
+                volume_arr = volume_arr[mask_v]
+                self.log(f"  -> Volume filtresi sonrası event sayısı: {np.count_nonzero(mask_v)}")
+
+            # Enerji spektrumu
+            centers, hist = make_energy_spectrum(edep, nbins=nbins_edep)
+            last_centers, last_hist = centers, hist
+
+            self._last_energy_centers = centers
+            self._last_energy_hist = hist
+            self._last_energy_xlabel = f"{edep_branch} [a.u.]"
+            self._last_energy_title = f"Energy Spectrum - {base}"
+
+            self.energy_canvas.plot_energy(
+                centers,
+                hist,
+                title=self._last_energy_title,
+                xlabel=self._last_energy_xlabel,
+                ylog=self.energy_log_cb.isChecked(),
+            )
+
+            png_edep = os.path.join(out_dir, f"{base}_EdepSpectrum.png")
+            csv_edep = os.path.join(out_dir, f"{base}_EdepSpectrum.csv")
+            try:
+                self.energy_canvas.figure.savefig(png_edep, dpi=300)
+                data_edep = np.vstack([centers, hist]).T
+                save_csv(csv_edep, "E_center,Counts", data_edep)
+                self.log(f"  -> Enerji spektrumu kaydedildi: {png_edep}, {csv_edep}")
+            except Exception as e:
+                self.log(f"[UYARI] Enerji spektrumu kaydedilemedi: {e}")
+
+            # Derinlik-doz
+            if z_arr is not None:
+                z_centers, dose = make_depth_dose(z_arr, edep, nbins=nbins_depth)
+                last_z_centers, last_dose = z_centers, dose
+                self.depth_canvas.plot_depth_dose(
+                    z_centers,
+                    dose,
+                    title=f"Depth-Dose - {base}",
+                    xlabel=z_branch or "Z",
+                )
+                png_dd = os.path.join(out_dir, f"{base}_DepthDose.png")
+                csv_dd = os.path.join(out_dir, f"{base}_DepthDose.csv")
+                try:
+                    self.depth_canvas.figure.savefig(png_dd, dpi=300)
+                    data_dd = np.vstack([z_centers, dose]).T
+                    save_csv(csv_dd, "Z_center,Dose_sumEdep", data_dd)
+                    self.log(f"  -> Derinlik-doz kaydedildi: {png_dd}, {csv_dd}")
+                except Exception as e:
+                    self.log(f"[UYARI] Derinlik-doz kaydedilemedi: {e}")
+
+            # 3D hit haritası
+            if (x_arr is not None) and (y_arr is not None) and (z_arr is not None):
+                max_points = 8000
+                if x_arr.size > max_points:
+                    idx_sample = np.random.choice(x_arr.size, size=max_points, replace=False)
+                    x_plot = x_arr[idx_sample]
+                    y_plot = y_arr[idx_sample]
+                    z_plot = z_arr[idx_sample]
+                    e_plot = edep[idx_sample]
+                    self.log(f"  -> 3D hit haritası için {x_arr.size} nokta içinden {max_points} tanesi örneklendi.")
+                else:
+                    x_plot = x_arr
+                    y_plot = y_arr
+                    z_plot = z_arr
+                    e_plot = edep
+
+                last_x, last_y, last_z = x_plot, y_plot, z_plot
+                last_edep_for_3d = e_plot
+                self.hit3d_canvas.plot_hits_3d(
+                    x_plot,
+                    y_plot,
+                    z_plot,
+                    edep=e_plot,
+                    title=f"3D Hits - {base}",
+                    xlabel=x_branch or "X",
+                    ylabel=y_branch or "Y",
+                    zlabel=z_branch or "Z",
+                )
+                png_3d = os.path.join(out_dir, f"{base}_Hit3D.png")
+                try:
+                    self.hit3d_canvas.figure.savefig(png_3d, dpi=300)
+                    self.log(f"  -> 3D hit haritası kaydedildi: {png_3d}")
+                except Exception as e:
+                    self.log(f"[UYARI] 3D hit haritası kaydedilemedi: {e}")
+            else:
+                self.log("  -> 3D hit haritası için X/Y/Z eksik, 3D grafik çizilmedi.")
+
+            # 2D doz haritası
+            if (x_arr is not None) and (z_arr is not None):
+                H2d, xedges, zedges = make_2d_dose_map(x_arr, z_arr, edep, nx=nx_2d, nz=nz_2d)
+                last_H2d, last_xedges, last_zedges = H2d, xedges, zedges
+                self.dose2d_canvas.plot_2d_dose(
+                    H2d,
+                    xedges,
+                    zedges,
+                    title=f"2D Doz Haritası (X-Z) - {base}",
+                    xlabel=x_branch or "X",
+                    ylabel=z_branch or "Z",
+                )
+                png_2d = os.path.join(out_dir, f"{base}_DoseMap_XZ.png")
+                csv_2d = os.path.join(out_dir, f"{base}_DoseMap_XZ.csv")
+                try:
+                    self.dose2d_canvas.figure.savefig(png_2d, dpi=300)
+                    with open(csv_2d, "w", encoding="utf-8") as fcsv:
+                        fcsv.write("# X edges:\n")
+                        fcsv.write(",".join(str(v) for v in xedges) + "\n")
+                        fcsv.write("# Z edges:\n")
+                        fcsv.write(",".join(str(v) for v in zedges) + "\n")
+                        fcsv.write("# Dose matrix (rows: Z bins, cols: X bins):\n")
+                        np.savetxt(fcsv, H2d, delimiter=",")
+                    self.log(f"  -> 2D doz haritası kaydedildi: {png_2d}, {csv_2d}")
+                except Exception as e:
+                    self.log(f"[UYARI] 2D doz haritası kaydedilemedi: {e}")
+            else:
+                self.log("  -> 2D doz haritası için X veya Z eksik, 2D grafik çizilmedi.")
+
+            # Zayıflama için toplam çıktı
+            if use_zwindow and (z_arr is not None) and (zmax_out > zmin_out):
+                total_I = compute_total_output_from_window(edep, z_arr, zmin_out, zmax_out)
+                self.log(f"  -> ΣEdep (Z penceresi [{zmin_out},{zmax_out}]) = {total_I:.6e}")
+            else:
+                total_I = compute_total_output_from_window(edep, None, None, None)
+                self.log(f"  -> ΣEdep (tüm hacim) = {total_I:.6e}")
+
+            self.total_outputs.append(total_I)
+            self.thickness_list.append(thickness_mm)
+            self.file_names.append(base)
+            self.log(f"  -> Kalınlık = {thickness_mm:.3f} mm")
+
+            # Parçacık özeti
+            if pid_arr is not None:
+                for pdg in np.unique(pid_arr):
+                    mask_p = (pid_arr == pdg)
+                    dose_p = float(np.sum(edep[mask_p]))
+                    self.particle_dose_summary[pdg] = self.particle_dose_summary.get(pdg, 0.0) + dose_p
+
+            # Volume özeti
+            if volume_arr is not None:
+                for vid in np.unique(volume_arr):
+                    mask_v2 = (volume_arr == vid)
+                    dose_v = float(np.sum(edep[mask_v2]))
+                    count_v = int(np.count_nonzero(mask_v2))
+                    total_dose, total_count = self.volume_dose_summary.get(vid, (0.0, 0))
+                    self.volume_dose_summary[vid] = (total_dose + dose_v, total_count + count_v)
+
+            # Track viewer için son dosyanın full verisini cache'e al
+            if (event_arr is not None) and (track_arr is not None) and (x_arr is not None) and (y_arr is not None) and (z_arr is not None):
+                self.track_last_x = x_arr
+                self.track_last_y = y_arr
+                self.track_last_z = z_arr
+                self.track_last_event = event_arr
+                self.track_last_track = track_arr
+                self.track_last_parent = parent_arr
+                self.track_last_volume = volume_arr
+                self.track_last_pdg = pid_arr
+                # Varsayılan olarak en küçük eventID'yi viewer'a yaz
+                try:
+                    ev_min = int(np.min(event_arr))
+                    self.track_event_spin.setValue(ev_min)
+                    self.log(f"  -> Track viewer için eventID aralığı: [{int(np.min(event_arr))}, {int(np.max(event_arr))}]")
+                except Exception:
+                    pass
+
+            QApplication.processEvents()
+
+        # Son çizilenler
+        if last_centers is not None and last_hist is not None:
+            self._last_energy_centers = last_centers
+            self._last_energy_hist = last_hist
+            self._last_energy_xlabel = f"{edep_branch} [a.u.]"
+            self._last_energy_title = "Son dosyanın Enerji Spektrumu"
+            self.energy_canvas.plot_energy(
+                last_centers,
+                last_hist,
+                title=self._last_energy_title,
+                xlabel=self._last_energy_xlabel,
+                ylog=self.energy_log_cb.isChecked(),
+            )
+
+        if last_z_centers is not None and last_dose is not None and (z_branch_user or z_branch):
+            self.depth_canvas.plot_depth_dose(
+                last_z_centers,
+                last_dose,
+                title="Son dosyanın Derinlik-Doz Profili",
+                xlabel=z_branch or z_branch_user or "Z",
+            )
+
+        if (last_x is not None) and (last_y is not None) and (last_z is not None):
+            self.hit3d_canvas.plot_hits_3d(
+                last_x,
+                last_y,
+                last_z,
+                edep=last_edep_for_3d,
+                title="Son dosyanın 3D Hit Haritası",
+            )
+        else:
+            self.hit3d_canvas.plot_hits_3d(
+                None,
+                None,
+                None,
+                edep=None,
+                title="3D Hit Haritası (X/Y/Z bulunamadı veya boş)",
+            )
+
+        if (last_H2d is not None) and (last_xedges is not None) and (last_zedges is not None):
+            self.dose2d_canvas.plot_2d_dose(
+                last_H2d,
+                last_xedges,
+                last_zedges,
+                title="Son dosyanın 2D Doz Haritası (X-Z)",
+            )
+
+        # Özet tablolar
+        self.update_summary_table(None)
+        self.update_particle_summary_table()
+        self.update_volume_summary_table()
+
+        # HVL/TVL
+        self.run_attenuation_analysis(out_dir)
+
+        # Track viewer'ı varsayılan event için güncelle
+        self.update_track_viewer_from_ui()
+
+        self.log("=== Analiz tamamlandı ===")
+        self.log("Not: 3D veya Track grafiğini göremiyorsan log'daki 'X/Y/Z eksik' mesajına bakıp branch isimlerini düzelt.")
+
+    def redraw_last_energy(self):
+        if self._last_energy_centers is None or self._last_energy_hist is None:
+            return
+        self.energy_canvas.plot_energy(
+            self._last_energy_centers,
+            self._last_energy_hist,
+            title=self._last_energy_title or "Energy Spectrum",
+            xlabel=self._last_energy_xlabel or "Edep [a.u.]",
+            ylog=self.energy_log_cb.isChecked(),
+        )
+
+    def update_summary_table(self, I_norm_full: Optional[np.ndarray]):
+        n = len(self.file_names)
+        self.summary_table.setRowCount(n)
+        for i in range(n):
+            name = self.file_names[i] if i < len(self.file_names) else ""
+            thickness = self.thickness_list[i] if i < len(self.thickness_list) else 0.0
+            totalI = self.total_outputs[i] if i < len(self.total_outputs) else 0.0
+
+            self.summary_table.setItem(i, 0, QTableWidgetItem(str(name)))
+            self.summary_table.setItem(i, 1, QTableWidgetItem(f"{thickness:.3f}"))
+            self.summary_table.setItem(i, 2, QTableWidgetItem(f"{totalI:.6e}"))
+
+            if I_norm_full is not None and i < len(I_norm_full) and np.isfinite(I_norm_full[i]):
+                self.summary_table.setItem(i, 3, QTableWidgetItem(f"{I_norm_full[i]:.6f}"))
+            else:
+                self.summary_table.setItem(i, 3, QTableWidgetItem("N/A"))
+
+        self.summary_table.resizeColumnsToContents()
+
+    def update_particle_summary_table(self):
+        summary = self.particle_dose_summary
+        if not summary:
+            self.particle_table.setRowCount(0)
+            return
+
+        pdgs = sorted(summary.keys())
+        total_all = float(sum(summary.values())) if summary else 0.0
+
+        self.particle_table.setRowCount(len(pdgs))
+        for i, pdg in enumerate(pdgs):
+            dose = summary[pdg]
+            frac = dose / total_all if total_all > 0.0 else 0.0
+            self.particle_table.setItem(i, 0, QTableWidgetItem(str(pdg)))
+            self.particle_table.setItem(i, 1, QTableWidgetItem(f"{dose:.6e}"))
+            self.particle_table.setItem(i, 2, QTableWidgetItem(f"{frac:.4f}"))
+        self.particle_table.resizeColumnsToContents()
+
+    def update_volume_summary_table(self):
+        summary = self.volume_dose_summary
+        if not summary:
+            self.volume_table.setRowCount(0)
+            return
+
+        vids = sorted(summary.keys())
+        total_all = float(sum(v[0] for v in summary.values())) if summary else 0.0
+
+        self.volume_table.setRowCount(len(vids))
+        for i, vid in enumerate(vids):
+            dose, count = summary[vid]
+            frac = dose / total_all if total_all > 0.0 else 0.0
+            self.volume_table.setItem(i, 0, QTableWidgetItem(str(vid)))
+            self.volume_table.setItem(i, 1, QTableWidgetItem(f"{dose:.6e}"))
+            self.volume_table.setItem(i, 2, QTableWidgetItem(str(count)))
+            self.volume_table.setItem(i, 3, QTableWidgetItem(f"{frac:.4f}"))
+        self.volume_table.resizeColumnsToContents()
+
+    def run_attenuation_analysis(self, out_dir: str):
+        if not self.thickness_list or not self.total_outputs:
+            self.log("[BİLGİ] HVL/TVL için veri yok.")
+            self.update_summary_table(None)
+            return
+
+        t_full = np.asarray(self.thickness_list, dtype=float)
+        I_full = np.asarray(self.total_outputs, dtype=float)
+
+        try:
+            mu, HVL, TVL, fit_curve, I0, mask = fit_attenuation(t_full.tolist(), I_full.tolist())
+        except Exception as e:
+            self.log(f"[BİLGİ] HVL/TVL hesabı atlandı: {e}")
+            self.update_summary_table(None)
+            return
+
+        t_valid = t_full[mask]
+        I_valid = I_full[mask]
+        I_norm_valid = I_valid / I0
+
+        I_norm_full = np.full_like(I_full, np.nan, dtype=float)
+        I_norm_full[mask] = I_norm_valid
+
+        t_fit = fit_curve[0]
+        I_fit = fit_curve[1]
+        I_fit_norm = I_fit / I0
+
+        self.atten_canvas.plot_attenuation(
+            t_valid,
+            I_norm_valid,
+            t_fit,
+            I_fit_norm,
+            mu,
+            HVL,
+            TVL,
+            title="Attenuation Curve (Total ΣEdep as I)",
+        )
+
+        png_att = os.path.join(out_dir, "AttenuationCurve.png")
+        csv_att = os.path.join(out_dir, "AttenuationData.csv")
+        try:
+            self.atten_canvas.figure.savefig(png_att, dpi=300)
+            data_att = np.vstack([t_valid, I_valid, I_norm_valid]).T
+            header = (
+                "Thickness_mm,TotalEdep,I_over_I0\n"
+                f"# mu[1/mm]={mu:.6f}, HVL[mm]={HVL:.6f}, TVL[mm]={TVL:.6f}"
+            )
+            save_csv(csv_att, header, data_att)
+            self.log("=== ZAYIFLAMA SONUÇLARI ===")
+            self.log(f"µ   = {mu:.6f} 1/mm")
+            self.log(f"HVL = {HVL:.6f} mm")
+            self.log(f"TVL = {TVL:.6f} mm")
+            self.log(f"AttenuationCurve.png ve AttenuationData.csv kaydedildi.")
+        except Exception as e:
+            self.log(f"[UYARI] Zayıflama verileri kaydedilemedi: {e}")
+
+        self.update_summary_table(I_norm_full)
+
+    # ---------- Track Viewer ----------
+
+    def update_track_viewer_from_ui(self):
+        if self.track_last_x is None or self.track_last_event is None or self.track_last_track is None:
+            self.track_canvas.plot_tracks(
+                None, None, None,
+                None, None, None, None, None,
+                selected_event=0,
+                title="Track Viewer (track verisi yok)",
+            )
+            return
+
+        selected_event = int(self.track_event_spin.value())
+        max_tracks = int(self.track_max_spin.value())
+        only_prim = self.track_only_primary_cb.isChecked()
+        only_sec = self.track_only_secondary_cb.isChecked()
+        pdg_filter = parse_int_list(self.track_pdg_filter_edit.text())
+
+        self.track_canvas.plot_tracks(
+            self.track_last_x,
+            self.track_last_y,
+            self.track_last_z,
+            self.track_last_event,
+            self.track_last_track,
+            self.track_last_parent,
+            self.track_last_volume,
+            self.track_last_pdg,
+            selected_event=selected_event,
+            max_tracks_to_draw=max_tracks,
+            only_primary=only_prim,
+            only_secondary=only_sec,
+            pdg_filter=pdg_filter if pdg_filter else None,
+            title="Track Viewer",
+        )
+
+
+def main():
+    app = QApplication(sys.argv)
+    win = MainWindow()
+    win.show()
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()
